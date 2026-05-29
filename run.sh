@@ -1,29 +1,12 @@
 #!/bin/bash
-cd "$(dirname "$0")"
-
-JAVA_CMD="./jdk/Contents/Home/bin/java"
-if [ ! -f "$JAVA_CMD" ]; then
-    JAVA_CMD="java"
-fi
-
-if [ $# -eq 0 ]; then
-    echo "Usage: ./run.sh /path/to/game.3ds"
-    echo ""
-    echo "Controls:"
-    echo "  Z/X/C/V     = A/B/X/Y"
-    echo "  Q/U         = L/R"
-    echo "  E/O         = ZL/ZR"
-    echo "  WASD        = Circle Pad"
-    echo "  IJKL        = C-Stick"
-    echo "  Arrow Keys  = D-Pad"
-    echo "  Enter/Esc   = Start/Select"
-    echo ""
-    echo "Run ./settings.sh in another terminal tab to open settings."
-    exit 0
-fi
-
-"$JAVA_CMD" \
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+JAVA="$DIR/jdk/Contents/Home/bin/java"
+KBFIX="$DIR/lib/keyboard_fix.dylib"
+[ ! -f "$KBFIX" ] && echo "WARNING: keyboard_fix.dylib missing" && KBFIX=""
+export DYLD_INSERT_LIBRARIES="$KBFIX"
+exec "$JAVA" \
     -XstartOnFirstThread \
     --enable-native-access=ALL-UNNAMED \
-    -Djava.library.path=./lib \
-    -jar Citra-macOS.jar "$@"
+    -Djava.library.path="$DIR/lib" \
+    -jar "$DIR/Citra-macOS.jar" "$@"
