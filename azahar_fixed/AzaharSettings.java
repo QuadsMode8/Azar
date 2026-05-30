@@ -3,85 +3,83 @@ import javax.swing.border.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.io.*;
+import java.net.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.List;
 
 /**
- * AzaharSettings — standalone settings window for the Azahar macOS emulator.
+ * AzaharSettings — full settings UI for Azahar macOS emulator.
  *
- * Replaces the old SettingsLauncher. Can be launched:
- *   - From ./settings.sh while a game is running
- *   - Directly before launching, to configure globally
- *
- * Reads and writes ~/Library/Application Support/Azahar/config/config.ini
- * Does NOT depend on NativeLibrary — runs without any game loaded.
- *
- * Sections covered (superset of the old CitraGUI + new performance settings):
- *   Audio    — emulation mode (HLE/LLE), stretching, realtime
- *   System   — New 3DS mode, LLE applets, region, CPU clock %
- *   Renderer — resolution, VSync, async shaders, HW shaders, texture filter,
- *              frame limit, accurate mul, shader JIT
- *   Layout   — screen layout, swap screens, screen gap, large screen proportion
+ * Config key fixes vs previous version:
+ *   - graphics_api: written as integer (2=Vulkan, 0=OpenGL) not string
+ *   - use_disk_shader_cache: under [Renderer] not [Utility]
+ *   - use_shared_font: under [System] not [Utility]
+ *   - plugin_loader: under [System] not [Utility]
+ *   - Section name is [Web Service] with space, not [WebService]
+ *   - mic_enabled + input_device written to [Audio] correctly
+ *   - isNew3DS_sys / lleApplets_sys are separate instances (NPE fix)
  */
 public class AzaharSettings extends JFrame {
 
-    // -----------------------------------------------------------------------
-    // Config path
-    // -----------------------------------------------------------------------
     private static final String CONFIG_PATH =
         System.getProperty("user.home") +
         "/Library/Application Support/Azahar/config/config.ini";
+    private static final String AZAHAR_DIR =
+        System.getProperty("user.home") +
+        "/Library/Application Support/Azahar";
 
-    // -----------------------------------------------------------------------
-    // Dark theme palette (matches a game emulator aesthetic — no generic greys)
-    // -----------------------------------------------------------------------
-    private static final Color BG          = new Color(0x18, 0x18, 0x1E);
-    private static final Color BG_PANEL    = new Color(0x22, 0x22, 0x2C);
-    private static final Color BG_FIELD    = new Color(0x2A, 0x2A, 0x38);
-    private static final Color ACCENT      = new Color(0x5B, 0xAD, 0xFF);
-    private static final Color ACCENT_HOVER= new Color(0x7C, 0xC4, 0xFF);
-    private static final Color TEXT_MAIN   = new Color(0xE8, 0xE8, 0xF0);
-    private static final Color TEXT_DIM    = new Color(0x88, 0x88, 0xA0);
-    private static final Color TEXT_WARN   = new Color(0xFF, 0xC0, 0x5A);
-    private static final Color BORDER_SUB  = new Color(0x35, 0x35, 0x48);
-    private static final Color BTN_SAVE    = new Color(0x3A, 0x8C, 0x5A);
-    private static final Color BTN_SAVE_H  = new Color(0x4A, 0xAC, 0x6E);
+    private static final Color BG         = new Color(0x18, 0x18, 0x1E);
+    private static final Color BG_PANEL   = new Color(0x22, 0x22, 0x2C);
+    private static final Color BG_FIELD   = new Color(0x2A, 0x2A, 0x38);
+    private static final Color ACCENT     = new Color(0x5B, 0xAD, 0xFF);
+    private static final Color TEXT_MAIN  = new Color(0xE8, 0xE8, 0xF0);
+    private static final Color TEXT_DIM   = new Color(0x88, 0x88, 0xA0);
+    private static final Color TEXT_WARN  = new Color(0xFF, 0xC0, 0x5A);
+    private static final Color BORDER_SUB = new Color(0x35, 0x35, 0x48);
+    private static final Color BTN_SAVE   = new Color(0x3A, 0x8C, 0x5A);
 
-    // -----------------------------------------------------------------------
-    // All config state — loaded on open, written on save
-    // -----------------------------------------------------------------------
+    // Performance tab
+    private JComboBox<String> audioMode;
+    private JCheckBox audioStretch, audioRT;
+    private JCheckBox isNew3DS, lleApplets;
+    private JSpinner cpuClock;
 
-    // Audio
-    private JComboBox<String> audioMode;       // HLE / LLE
-    private JCheckBox audioStretching;
-    private JCheckBox audioRealtime;
+    // Graphics tab
+    private JComboBox<String> graphicsAPI; // 0=OpenGL, 2=Vulkan
+    private JSpinner resFactor;
+    private JCheckBox integerScaling, vsync;
+    private JSpinner frameLimit;
+    private JCheckBox hwShaders, asyncShaders, shaderJIT, accurateMul, simulate3DSGPU;
+    private JComboBox<String> texFilter;
+    private JSpinner aaSamples;
+    private JCheckBox linearFilter, disableRightEye;
 
-    // System
-    private JCheckBox isNew3DS;
-    private JCheckBox lleApplets;
-    private JComboBox<String> regionValue;     // Auto / Japan / USA / Europe / Australia / China / Korea / Taiwan
-    private JSpinner cpuClock;                 // 5–400 %
-
-    // Renderer
-    private JSpinner resolutionFactor;         // 1–6
-    private JCheckBox vsync;
-    private JCheckBox asyncShaders;
-    private JCheckBox hwShaders;
-    private JCheckBox shaderJIT;
-    private JCheckBox accurateMul;
-    private JSpinner frameLimit;               // 0 (unlimited) – 200
-    private JComboBox<String> textureFilter;   // None / Anime4K / Bicubic / ScaleForce / xBRZ / MMPX
-
-    // Layout
-    private JComboBox<String> layoutOption;    // Default / Single Screen / Large Screen / Side by Side / Medium Screen
+    // Layout tab
+    private JComboBox<String> layout;
     private JCheckBox swapScreens;
-    private JSpinner screenGap;
-    private JSpinner largeScreenProportion;
+    private JSpinner screenGap, largeScreenRatio;
+    private JCheckBox portrait, hideMouseInactive;
 
-    // -----------------------------------------------------------------------
-    // Raw INI lines — sections we don't touch are preserved verbatim
-    // -----------------------------------------------------------------------
+    // System tab
+    private JComboBox<String> region;
+    private JCheckBox regionFree, useVirtualSD, diskShaderCache, sharedFont, pluginLoader;
+    private JCheckBox isNew3DS_sys, lleApplets_sys; // FIX: own instances
+
+    // Camera/Mic tab
+    private JComboBox<String> camInner, camOuterL, camOuterR;
+    private JCheckBox micEnabled;
+    private JComboBox<String> audioIn;
+
+    // Network tab
+    private JCheckBox enableNetwork;
+    private JTextField networkInterface;
+
+    // System Files tab
+    private JLabel stAES, stSeed, stSave;
+    private JButton btnAES, btnSeed, btnFix, btnAll;
+    private JTextArea dlLog;
+
     private List<String> rawLines = new ArrayList<>();
 
     public AzaharSettings() {
@@ -89,638 +87,596 @@ public class AzaharSettings extends JFrame {
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         setBackground(BG);
         setResizable(false);
-
         buildUI();
         loadConfig();
         pack();
-        setMinimumSize(new Dimension(560, 500));
+        setMinimumSize(new Dimension(640, 560));
         setLocationRelativeTo(null);
     }
 
-    // -----------------------------------------------------------------------
-    // UI construction
-    // -----------------------------------------------------------------------
     private void buildUI() {
-        JPanel root = new JPanel(new BorderLayout(0, 0));
+        JPanel root = new JPanel(new BorderLayout());
         root.setBackground(BG);
 
-        // Header bar
         JPanel header = new JPanel(new BorderLayout());
         header.setBackground(new Color(0x10, 0x10, 0x16));
         header.setBorder(BorderFactory.createEmptyBorder(14, 20, 14, 20));
         JLabel title = new JLabel("Azahar  Settings");
         title.setFont(new Font("Menlo", Font.BOLD, 16));
         title.setForeground(ACCENT);
-        JLabel subtitle = new JLabel("Global configuration · ~/Library/Application Support/Azahar/config/config.ini");
-        subtitle.setFont(new Font("Menlo", Font.PLAIN, 10));
-        subtitle.setForeground(TEXT_DIM);
-        JPanel titleBox = new JPanel(new BorderLayout(0, 3));
-        titleBox.setOpaque(false);
-        titleBox.add(title, BorderLayout.NORTH);
-        titleBox.add(subtitle, BorderLayout.SOUTH);
-        header.add(titleBox, BorderLayout.WEST);
+        JLabel sub = new JLabel("Global configuration · " + CONFIG_PATH);
+        sub.setFont(new Font("Menlo", Font.PLAIN, 10));
+        sub.setForeground(TEXT_DIM);
+        JPanel tb = new JPanel(new BorderLayout(0, 3)); tb.setOpaque(false);
+        tb.add(title, BorderLayout.NORTH); tb.add(sub, BorderLayout.SOUTH);
+        header.add(tb, BorderLayout.WEST);
         root.add(header, BorderLayout.NORTH);
 
-        // Tabbed content
         JTabbedPane tabs = new JTabbedPane();
-        tabs.setBackground(BG);
-        tabs.setForeground(TEXT_MAIN);
+        tabs.setBackground(BG); tabs.setForeground(TEXT_MAIN);
         styleTabPane(tabs);
-
-        tabs.addTab("⚡  Performance", buildPerformanceTab());
-        tabs.addTab("🎮  System",      buildSystemTab());
-        tabs.addTab("🖥  Graphics",    buildGraphicsTab());
-        tabs.addTab("📐  Layout",      buildLayoutTab());
-
+        tabs.addTab("⚡  Performance", perfTab());
+        tabs.addTab("🖥  Graphics",    gfxTab());
+        tabs.addTab("📐  Layout",      layoutTab());
+        tabs.addTab("🎮  System",      sysTab());
+        tabs.addTab("📷  Camera / Mic",camTab());
+        tabs.addTab("🌐  Network",     netTab());
+        tabs.addTab("📁  System Files",filesTab());
         root.add(tabs, BorderLayout.CENTER);
 
-        // Bottom bar
         JPanel bottom = new JPanel(new BorderLayout());
         bottom.setBackground(new Color(0x10, 0x10, 0x16));
         bottom.setBorder(new CompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_SUB),
-            BorderFactory.createEmptyBorder(12, 20, 12, 20)
-        ));
-
-        JLabel notice = new JLabel("Restart the emulator after changing Graphics or Layout settings.");
-        notice.setFont(new Font("Menlo", Font.PLAIN, 10));
-        notice.setForeground(TEXT_WARN);
-
-        JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
-        btnRow.setOpaque(false);
-        JButton cancelBtn = styledButton("Cancel", BG_FIELD, TEXT_DIM);
-        JButton saveBtn   = styledButton("Save & Close", BTN_SAVE, TEXT_MAIN);
-        saveBtn.setFont(new Font("Menlo", Font.BOLD, 13));
-
-        cancelBtn.addActionListener(e -> dispose());
-        saveBtn.addActionListener(e -> { saveConfig(); dispose(); });
-
-        btnRow.add(cancelBtn);
-        btnRow.add(saveBtn);
-
-        bottom.add(notice, BorderLayout.WEST);
-        bottom.add(btnRow, BorderLayout.EAST);
+            BorderFactory.createMatteBorder(1,0,0,0,BORDER_SUB),
+            BorderFactory.createEmptyBorder(12,20,12,20)));
+        JLabel notice = new JLabel("Restart emulator after changing Graphics or Layout settings.");
+        notice.setFont(new Font("Menlo", Font.PLAIN, 10)); notice.setForeground(TEXT_WARN);
+        JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0)); btnRow.setOpaque(false);
+        JButton cancel = styledButton("Cancel", BG_FIELD, TEXT_DIM);
+        JButton save   = styledButton("Save & Close", BTN_SAVE, TEXT_MAIN);
+        save.setFont(new Font("Menlo", Font.BOLD, 13));
+        cancel.addActionListener(e -> dispose());
+        save.addActionListener(e -> { saveConfig(); dispose(); });
+        btnRow.add(cancel); btnRow.add(save);
+        bottom.add(notice, BorderLayout.WEST); bottom.add(btnRow, BorderLayout.EAST);
         root.add(bottom, BorderLayout.SOUTH);
-
         setContentPane(root);
     }
 
-    // -----------------------------------------------------------------------
-    // Tab: Performance — the critical settings that affect speed and stability
-    // -----------------------------------------------------------------------
-    private JPanel buildPerformanceTab() {
+    private JPanel perfTab() {
         JPanel p = tabPanel();
-
         addSectionHeader(p, "Audio");
-        addRow(p, "Audio Emulation",
-            "HLE is faster and stable. LLE (Teakra) is accurate but very CPU-heavy\n" +
-            "and crashes on arm64 for some games (e.g. Majora's Mask 3D).",
-            audioMode = combo("HLE", "LLE"));
-
-        addRow(p, "Audio Stretching",
-            "Stretch audio to compensate for emulation speed variance.\n" +
-            "Reduces crackling when the emulator runs slightly under full speed.",
-            audioStretching = check());
-
-        addRow(p, "Realtime Audio",
-            "Forces audio output to run in real-time. Can cause stuttering\n" +
-            "if emulation isn't keeping up. Leave off unless you have a reason.",
-            audioRealtime = check());
-
-        addSectionHeader(p, "CPU / System Speed");
-        addRow(p, "New 3DS Mode",
-            "Emulate the New Nintendo 3DS (804 MHz CPU, extra RAM).\n" +
-            "STRONGLY RECOMMENDED: leaving this off cuts emulated CPU speed to 1/3.\n" +
-            "Most games released after 2014 expect New 3DS hardware.",
-            isNew3DS = check());
-
-        addRow(p, "CPU Clock %",
-            "Scale the emulated CPU clock. 100 = normal speed.\n" +
-            "Increase for slowdown reduction; decrease to save battery.",
-            cpuClock = spinner(100, 5, 400, 5));
-
-        addRow(p, "LLE Applets",
-            "Use LLE (accurate) emulation for system applets.\n" +
-            "Required for some games. Adds slight overhead but improves compatibility.",
-            lleApplets = check());
-
+        addRow(p, "Audio Mode",       "HLE=fast/stable. LLE=accurate but crashes on arm64 for some games", audioMode    = combo("HLE","LLE"));
+        addRow(p, "Audio Stretching", "Reduce crackling when emulation speed varies",                       audioStretch = check());
+        addRow(p, "Realtime Audio",   "Force real-time audio output (off is safer)",                       audioRT      = check());
+        addSectionHeader(p, "CPU");
+        addRow(p, "New 3DS Mode",     "Faster CPU + more RAM. Keep ON for almost all games",               isNew3DS     = check());
+        addRow(p, "CPU Clock %",      "100=normal speed. Raise for slowdown, lower to save battery",       cpuClock     = spinner(100,5,400,5));
+        addRow(p, "LLE Applets",      "Accurate system applets. Required by some games",                   lleApplets   = check());
         return p;
     }
 
-    // -----------------------------------------------------------------------
-    // Tab: System
-    // -----------------------------------------------------------------------
-    private JPanel buildSystemTab() {
+    private JPanel gfxTab() {
         JPanel p = tabPanel();
-
-        addSectionHeader(p, "Console");
-        addRow(p, "Region",
-            "Console region. Auto (-1) lets games run in their native region.\n" +
-            "Change only if a game refuses to boot.",
-            regionValue = combo("Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"));
-
-        addSectionHeader(p, "Compatibility");
-        addRow(p, "New 3DS Mode",
-            "Same as the Performance tab — shown here for visibility.\n" +
-            "Affects memory layout and CPU frequency available to games.",
-            isNew3DS); // shared component — same checkbox object
-
-        addRow(p, "LLE Applets",
-            "Same as the Performance tab — shared setting.",
-            lleApplets); // shared
-
-        return p;
-    }
-
-    // -----------------------------------------------------------------------
-    // Tab: Graphics
-    // -----------------------------------------------------------------------
-    private JPanel buildGraphicsTab() {
-        JPanel p = tabPanel();
-
-        addSectionHeader(p, "Resolution & Display");
-        addRow(p, "Resolution Factor",
-            "Internal rendering resolution multiplier (1x = native 3DS, 6x = very high).\n" +
-            "Higher values look sharper but cost GPU. M3: 1–2x recommended. M4: 4x fine.",
-            resolutionFactor = spinner(1, 1, 6, 1));
-
-        addRow(p, "VSync",
-            "Synchronize rendering to your display refresh rate.\n" +
-            "Prevents tearing. Slight input latency increase.",
-            vsync = check());
-
-        addRow(p, "Frame Limit %",
-            "Cap emulation speed as a percentage of 60fps. 0 = unlimited.\n" +
-            "100 = full speed. 200 = allow up to 2× fast-forward.",
-            frameLimit = spinner(100, 0, 200, 10));
-
+        addSectionHeader(p, "API & Resolution");
+        addRow(p, "Graphics API",       "Vulkan recommended on Apple Silicon",                             graphicsAPI    = combo("Vulkan","OpenGL"));
+        addRow(p, "Resolution Factor",  "1x=native 240p. 2x=480p. 4x=960p. Higher=more GPU",             resFactor      = spinner(1,1,6,1));
+        addRow(p, "Integer Scaling",    "Snap resolution to exact integer multiples only",                 integerScaling = check());
+        addRow(p, "VSync",              "Sync to display refresh rate. Prevents tearing",                  vsync          = check());
+        addRow(p, "Frame Limit %",      "100=60fps cap. 0=unlimited. 200=allow 2x fast-forward",          frameLimit     = spinner(100,0,200,10));
         addSectionHeader(p, "Shaders");
-        addRow(p, "Hardware Shaders",
-            "Compile 3DS shaders to run on the GPU instead of CPU.\n" +
-            "Major performance improvement. Should always be on.",
-            hwShaders = check());
-
-        addRow(p, "Async Shader Compilation",
-            "Compile shaders in the background to avoid stuttering on first load.\n" +
-            "May cause brief visual glitches while shaders compile. Recommended.",
-            asyncShaders = check());
-
-        addRow(p, "Shader JIT",
-            "Use a JIT compiler for the shader engine.\n" +
-            "Faster than interpreter. Leave on unless you see graphical bugs.",
-            shaderJIT = check());
-
-        addRow(p, "Accurate Shader Mul",
-            "More accurate multiply operations in shaders.\n" +
-            "Fixes some graphical glitches but reduces performance.",
-            accurateMul = check());
-
-        addSectionHeader(p, "Texture");
-        addRow(p, "Texture Filter",
-            "Post-process filter applied to textures.\n" +
-            "None = raw output. xBRZ/Anime4K = smoother upscaling.",
-            textureFilter = combo("None", "Anime4K Ultrafast", "Bicubic", "ScaleForce", "xBRZ", "MMPX"));
-
+        addRow(p, "Hardware Shaders",   "Run shaders on GPU. Major speedup. Keep ON",                     hwShaders      = check());
+        addRow(p, "Async Shaders",      "Compile shaders in background. Less stutter on first load",      asyncShaders   = check());
+        addRow(p, "Shader JIT",         "JIT compile shader engine. Keep ON",                             shaderJIT      = check());
+        addRow(p, "Accurate Multiply",  "More precise shader math. Fixes some glitches, costs performance",accurateMul    = check());
+        addRow(p, "Simulate 3DS GPU",   "Accurate GPU timing. Fixes some games, hurts performance",       simulate3DSGPU = check());
+        addSectionHeader(p, "Texture & AA");
+        addRow(p, "Texture Filter",     "Upscaling filter applied to textures",
+               texFilter = combo("None","Anime4K Ultrafast","Anime4K Fast","Anime4K Medium","Anime4K High","Bicubic","ScaleForce","xBRZ","MMPX"));
+        addRow(p, "MSAA Samples",       "Anti-aliasing. 1=off. 2/4/8/16=quality levels",                  aaSamples      = spinner(1,1,16,1));
+        addRow(p, "Linear Filter",      "Bilinear output filter on final image",                          linearFilter   = check());
+        addRow(p, "Disable Right Eye",  "Mono rendering only. Saves ~50% GPU",                            disableRightEye= check());
         return p;
     }
 
-    // -----------------------------------------------------------------------
-    // Tab: Layout
-    // -----------------------------------------------------------------------
-    private JPanel buildLayoutTab() {
+    private JPanel layoutTab() {
         JPanel p = tabPanel();
-
         addSectionHeader(p, "Screen Arrangement");
-        addRow(p, "Layout",
-            "How the top and bottom 3DS screens are arranged in the window.",
-            layoutOption = combo("Default", "Single Screen", "Large Screen", "Side by Side", "Medium Screen"));
-
-        addRow(p, "Swap Screens",
-            "Swap which screen appears on top.\n" +
-            "Useful for games where the action is on the bottom screen.",
-            swapScreens = check());
-
-        addRow(p, "Screen Gap (px)",
-            "Pixel gap between the two screens.",
-            screenGap = spinner(0, 0, 100, 1));
-
-        addRow(p, "Large Screen Ratio",
-            "Size ratio of the large screen relative to the small one.\n" +
-            "Only applies to 'Large Screen' layout. Default is 2.25.",
-            largeScreenProportion = spinner(225, 100, 500, 25)); // stored as ×100 to avoid float spinner
-
+        addRow(p, "Layout",             "How top/bottom 3DS screens are arranged",
+               layout = combo("Default","Single Screen","Large Screen","Side by Side","Medium Screen","Separate Windows"));
+        addRow(p, "Swap Screens",       "Put the bottom screen on top",                                   swapScreens      = check());
+        addRow(p, "Screen Gap (px)",    "Pixel gap between the two screens",                              screenGap        = spinner(0,0,100,1));
+        addRow(p, "Large Screen Ratio", "Size of large screen vs small. 225 = 2.25x (Large layout only)",largeScreenRatio = spinner(225,100,500,25));
+        addSectionHeader(p, "Display");
+        addRow(p, "Portrait Mode",      "Rotate screens for vertical/portrait display",                   portrait          = check());
+        addRow(p, "Hide Inactive Mouse","Hide cursor when it's over the game window",                     hideMouseInactive  = check());
         return p;
     }
 
-    // -----------------------------------------------------------------------
-    // Config I/O
-    // -----------------------------------------------------------------------
-    private void loadConfig() {
-        File f = new File(CONFIG_PATH);
-        if (!f.exists()) {
-            showStatus("Config file not found — defaults loaded. Save to create it.", TEXT_WARN);
-            applyDefaults();
+    private JPanel sysTab() {
+        JPanel p = tabPanel();
+        addSectionHeader(p, "Console");
+        addRow(p, "Region", "Console region. Auto lets the game decide",
+               region = combo("Auto","Japan","USA","Europe","Australia","China","Korea","Taiwan"));
+        addRow(p, "Region Free Patch",  "Bypass region lock. Lets any region game boot",                  regionFree      = check());
+        addSectionHeader(p, "Compatibility");
+        addRow(p, "New 3DS Mode",       "Same as Performance tab",                                        isNew3DS_sys    = check());
+        addRow(p, "LLE Applets",        "Same as Performance tab",                                        lleApplets_sys  = check());
+        addSectionHeader(p, "Storage");
+        addRow(p, "Virtual SD Card",    "Use emulated SD card for saves and data",                        useVirtualSD    = check());
+        addRow(p, "Disk Shader Cache",  "Save compiled shaders to disk. Faster subsequent loads",         diskShaderCache = check());
+        addSectionHeader(p, "System Modules");
+        addRow(p, "Shared Font",        "Use system fonts dumped from a real 3DS",                        sharedFont      = check());
+        addRow(p, "Plugin Loader",      "Enable Luma3DS-style plugin loading",                            pluginLoader    = check());
+        addSectionHeader(p, "Mii Editor");
+        JLabel miiNote = new JLabel("Requires NAND system files dumped from a real 3DS via Azahar Artic Setup Tool.");
+        miiNote.setFont(new Font("Menlo", Font.PLAIN, 10)); miiNote.setForeground(TEXT_DIM);
+        miiNote.setAlignmentX(Component.LEFT_ALIGNMENT);
+        p.add(miiNote); p.add(Box.createVerticalStrut(4));
+        JButton miiBtn = styledButton("Launch Mii Editor", BG_FIELD, TEXT_MAIN);
+        miiBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+        miiBtn.addActionListener(e -> openMiiEditor());
+        p.add(miiBtn);
+        return p;
+    }
+
+    private JPanel camTab() {
+        JPanel p = tabPanel();
+        addSectionHeader(p, "Camera");
+        addRow(p, "Inner Camera",       "Front-facing (selfie) camera source",
+               camInner  = combo("blank (disabled)","image (static image)","opencv (webcam)"));
+        addRow(p, "Outer Left Camera",  "Outer left camera source",
+               camOuterL = combo("blank (disabled)","image (static image)","opencv (webcam)"));
+        addRow(p, "Outer Right Camera", "Outer right camera source",
+               camOuterR = combo("blank (disabled)","image (static image)","opencv (webcam)"));
+        JLabel cn = note("opencv requires a webcam connected. Most games only use the inner camera.");
+        p.add(Box.createVerticalStrut(6)); p.add(cn);
+
+        addSectionHeader(p, "Microphone");
+        addRow(p, "Enable Microphone",  "Allow games to use your Mac's microphone",                       micEnabled = check());
+        addRow(p, "Mic Input Source",   "auto = system default microphone",
+               audioIn = combo("auto","null","Static Noise"));
+        JLabel mn = note("mic_fix.dylib must be built and loaded for mic to work.\n" +
+                         "macOS will prompt for permission on first use.\n" +
+                         "Grant access in System Settings → Privacy → Microphone.");
+        p.add(Box.createVerticalStrut(6)); p.add(mn);
+        return p;
+    }
+
+    private JPanel netTab() {
+        JPanel p = tabPanel();
+        addSectionHeader(p, "Local Wireless");
+        addRow(p, "Enable Network", "Enable 3DS local wireless / StreetPass emulation", enableNetwork = check());
+        JPanel row = new JPanel(new BorderLayout(12,0));
+        row.setBackground(BG_PANEL); row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 52));
+        row.setBorder(new CompoundBorder(BorderFactory.createMatteBorder(0,0,1,0,BORDER_SUB),BorderFactory.createEmptyBorder(8,12,8,12)));
+        JPanel lbl = new JPanel(new BorderLayout(0,2)); lbl.setOpaque(false);
+        JLabel n = new JLabel("Network Interface"); n.setFont(new Font("Menlo",Font.PLAIN,13)); n.setForeground(TEXT_MAIN);
+        JLabel h = new JLabel("e.g. en0 — leave blank for auto"); h.setFont(new Font("Menlo",Font.PLAIN,10)); h.setForeground(TEXT_DIM);
+        lbl.add(n, BorderLayout.NORTH); lbl.add(h, BorderLayout.SOUTH);
+        networkInterface = new JTextField(12);
+        networkInterface.setBackground(BG_FIELD); networkInterface.setForeground(TEXT_MAIN);
+        networkInterface.setCaretColor(TEXT_MAIN); networkInterface.setFont(new Font("Menlo",Font.PLAIN,12));
+        networkInterface.setBorder(BorderFactory.createEmptyBorder(4,6,4,6));
+        row.add(lbl, BorderLayout.CENTER); row.add(networkInterface, BorderLayout.EAST);
+        p.add(row); p.add(Box.createVerticalStrut(2));
+        p.add(Box.createVerticalStrut(8));
+        p.add(note("For internet multiplayer, both players need the same Azahar version,\nthis option enabled, and a shared VPN (e.g. Tailscale or ZeroTier)."));
+        return p;
+    }
+
+    private JPanel filesTab() {
+        JPanel p = tabPanel();
+        addSectionHeader(p, "System Files Manager");
+        JPanel sp = new JPanel(new GridLayout(3,2,8,6)); sp.setOpaque(false);
+        sp.setAlignmentX(Component.LEFT_ALIGNMENT); sp.setMaximumSize(new Dimension(Integer.MAX_VALUE,90));
+        sp.add(lbl("AES Keys (aes_keys.txt)", TEXT_MAIN)); sp.add(stAES  = lbl("checking...", TEXT_DIM));
+        sp.add(lbl("SeedDB (seeddb.bin)",     TEXT_MAIN)); sp.add(stSeed = lbl("checking...", TEXT_DIM));
+        sp.add(lbl("Save Archive Fix",         TEXT_MAIN)); sp.add(stSave = lbl("checking...", TEXT_DIM));
+        p.add(sp); p.add(Box.createVerticalStrut(10));
+        JPanel bp = new JPanel(new FlowLayout(FlowLayout.LEFT,6,0)); bp.setOpaque(false); bp.setAlignmentX(Component.LEFT_ALIGNMENT);
+        btnAES  = styledButton("Get AES Keys",   BG_FIELD, TEXT_MAIN);
+        btnSeed = styledButton("Get SeedDB",     BG_FIELD, TEXT_MAIN);
+        btnFix  = styledButton("Fix Save Dirs",  BG_FIELD, TEXT_MAIN);
+        btnAll  = styledButton("Fix Everything", BTN_SAVE,  TEXT_MAIN);
+        bp.add(btnAES); bp.add(btnSeed); bp.add(btnFix); bp.add(btnAll);
+        p.add(bp); p.add(Box.createVerticalStrut(10));
+        dlLog = new JTextArea(8,50); dlLog.setEditable(false);
+        dlLog.setBackground(new Color(0x10,0x10,0x16)); dlLog.setForeground(TEXT_DIM);
+        dlLog.setFont(new Font("Menlo",Font.PLAIN,11));
+        JScrollPane sc = new JScrollPane(dlLog); sc.setAlignmentX(Component.LEFT_ALIGNMENT);
+        sc.setMaximumSize(new Dimension(Integer.MAX_VALUE,170)); sc.setBorder(BorderFactory.createLineBorder(BORDER_SUB));
+        p.add(sc);
+        btnAES.addActionListener(e  -> run(() -> { doAES();     refresh(); }));
+        btnSeed.addActionListener(e -> run(() -> { doSeed();    refresh(); }));
+        btnFix.addActionListener(e  -> run(() -> { doSaveFix(); refresh(); }));
+        btnAll.addActionListener(e  -> run(() -> { doAES(); doSeed(); doSaveFix(); log("\n\u2713 Done!\n"); refresh(); }));
+        SwingUtilities.invokeLater(this::refresh);
+        dlLog.setText("Ready.\n");
+        return p;
+    }
+
+    // ── System files logic ────────────────────────────────────────────────────
+
+    private void run(Runnable r) {
+        setFileBtns(false);
+        new Thread(() -> { r.run(); SwingUtilities.invokeLater(() -> setFileBtns(true)); }).start();
+    }
+    private void setFileBtns(boolean on) { btnAES.setEnabled(on); btnSeed.setEnabled(on); btnFix.setEnabled(on); btnAll.setEnabled(on); }
+    private void log(String s) { SwingUtilities.invokeLater(() -> { dlLog.append(s); dlLog.setCaretPosition(dlLog.getDocument().getLength()); }); }
+
+    private void refresh() {
+        boolean hasAES  = new File(AZAHAR_DIR+"/sysdata/aes_keys.txt").exists();
+        boolean hasSeed = new File(AZAHAR_DIR+"/sysdata/seeddb.bin").exists();
+        boolean hasSave = new File(AZAHAR_DIR+"/sdmc/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000/title").exists();
+        Color ok = new Color(0x4A,0xAC,0x6E);
+        SwingUtilities.invokeLater(() -> {
+            stAES.setText(hasAES   ? "\u2713 Ready" : "\u2717 Missing");  stAES.setForeground(hasAES   ? ok : TEXT_WARN);
+            stSeed.setText(hasSeed ? "\u2713 Ready" : "\u2717 Missing");  stSeed.setForeground(hasSeed ? ok : TEXT_WARN);
+            stSave.setText(hasSave ? "\u2713 Ready" : "\u2717 Run Fix");  stSave.setForeground(hasSave ? ok : TEXT_WARN);
+        });
+    }
+
+    private void doAES() {
+        log("Downloading AES keys...\n");
+        File dest = new File(AZAHAR_DIR+"/sysdata/aes_keys.txt"); dest.getParentFile().mkdirs();
+        if (!fetch("https://raw.githubusercontent.com/NINTENDO3DSSYSTEM50678/LLAVES-PARA-CITRA-/main/aes_keys.txt", dest))
+            log("  Failed. Manually place aes_keys.txt in: "+dest.getParent()+"\n");
+    }
+
+    private void doSeed() {
+        log("Downloading SeedDB...\n");
+        File dest = new File(AZAHAR_DIR+"/sysdata/seeddb.bin"); dest.getParentFile().mkdirs();
+        if (!fetch("https://github.com/ihaveamac/3DS-rom-tools/raw/master/seeddb/seeddb.bin", dest))
+            log("  Failed. Get seeddb.bin from https://github.com/ihaveamac/3DS-rom-tools\n");
+    }
+
+    private boolean fetch(String url, File dest) {
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(10000); c.setReadTimeout(30000);
+            c.setInstanceFollowRedirects(true);
+            c.setRequestProperty("User-Agent","AzaharSettings/2.0");
+            int code = c.getResponseCode();
+            log("HTTP "+code+"\n");
+            if (code != 200) return false;
+            byte[] buf = new byte[8192]; int n; long total=0;
+            try (InputStream in=c.getInputStream(); FileOutputStream out=new FileOutputStream(dest)) {
+                while ((n=in.read(buf))!=-1) { out.write(buf,0,n); total+=n; log("\r  "+(total/1024)+"KB..."); }
+            }
+            log("  \u2713 "+(total/1024)+"KB saved\n"); return true;
+        } catch (Exception e) { log("  \u2717 "+e.getMessage()+"\n"); return false; }
+    }
+
+    private void doSaveFix() {
+        log("Fixing save directories...\n");
+        String sdmc = AZAHAR_DIR+"/sdmc/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000";
+        for (String d : new String[]{sdmc+"/title",sdmc+"/extdata",
+                AZAHAR_DIR+"/nand/data/00000000000000000000000000000000/sysdata",
+                AZAHAR_DIR+"/nand/data/00000000000000000000000000000000/extdata",
+                AZAHAR_DIR+"/cheats",AZAHAR_DIR+"/screenshots",
+                AZAHAR_DIR+"/textures",AZAHAR_DIR+"/shaders"}) {
+            new File(d).mkdirs(); log("  \u2713 "+d.replace(AZAHAR_DIR,"~Azahar")+"\n");
+        }
+        File mov = new File(AZAHAR_DIR+"/nand/data/00000000000000000000000000000000/sysdata/0001f2/movable.sed");
+        if (!mov.exists()) { mov.getParentFile().mkdirs();
+            try { new FileOutputStream(mov).close(); log("  \u2713 movable.sed created\n"); }
+            catch (Exception e) { log("  \u2717 "+e.getMessage()+"\n"); } }
+        log("  \u2713 Done\n");
+    }
+
+    private void openMiiEditor() {
+        File app = new File(AZAHAR_DIR+"/nand/00000000000000000000000000000000/title/00040030/00009802/content/00000000.app");
+        if (!app.exists()) {
+            JOptionPane.showMessageDialog(this,
+                "Mii Editor needs NAND system files dumped from a real 3DS.\n\n"+
+                "Use the Azahar Artic Setup Tool to dump your console's system files,\n"+
+                "then copy them to:\n"+AZAHAR_DIR+"/nand/",
+                "System Files Required", JOptionPane.WARNING_MESSAGE);
             return;
         }
+        JOptionPane.showMessageDialog(this,
+            "Found Mii Editor at:\n"+app.getAbsolutePath()+"\n\n"+
+            "Run the emulator with this path as the ROM argument to launch it.",
+            "Mii Editor", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    // ── Config I/O ────────────────────────────────────────────────────────────
+
+    private void loadConfig() {
+        File f = new File(CONFIG_PATH);
+        if (!f.exists()) { applyDefaults(); return; }
         try {
             rawLines = Files.readAllLines(f.toPath());
-            Map<String, Map<String, String>> ini = parseIni(rawLines);
+            Map<String,Map<String,String>> ini = parseIni(rawLines);
 
-            // Audio
-            setCombo(audioMode,     get(ini, "Audio",    "audio_emulation",  "HLE"));
-            setCheck(audioStretching, getBool(ini, "Audio", "enable_audio_stretching", true));
-            setCheck(audioRealtime,   getBool(ini, "Audio", "enable_realtime",          false));
+            // Audio / Performance
+            setCombo(audioMode,      get(ini,"Audio","audio_emulation","HLE"));
+            setCheck(audioStretch,   getBool(ini,"Audio","enable_audio_stretching",true));
+            setCheck(audioRT,        getBool(ini,"Audio","enable_realtime",false));
 
-            // System
-            setCheck(isNew3DS,    getBool(ini, "System", "is_new_3ds",  true));
-            setCheck(lleApplets,  getBool(ini, "System", "lle_applets", true));
-            setCombo(regionValue, regionIndexToName(getInt(ini, "System", "region_value", -1)));
-            setSpinner(cpuClock,  getInt(ini, "Core", "cpu_clock_percentage", 100));
+            // System — set both tab instances
+            boolean n3ds = getBool(ini,"System","is_new_3ds",true);
+            boolean lle  = getBool(ini,"System","lle_applets",true);
+            setCheck(isNew3DS,n3ds);     setCheck(isNew3DS_sys,n3ds);
+            setCheck(lleApplets,lle);    setCheck(lleApplets_sys,lle);
+            setSpinner(cpuClock, getInt(ini,"Core","cpu_clock_percentage",100));
 
-            // Renderer
-            setSpinner(resolutionFactor, getInt(ini, "Renderer", "resolution_factor", 1));
-            setCheck(vsync,         getBool(ini, "Renderer", "use_vsync_new",              true));
-            setCheck(asyncShaders,  getBool(ini, "Renderer", "async_shader_compilation",   true));
-            setCheck(hwShaders,     getBool(ini, "Renderer", "use_hw_shader",              true));
-            setCheck(shaderJIT,     getBool(ini, "Renderer", "use_shader_jit",             true));
-            setCheck(accurateMul,   getBool(ini, "Renderer", "shaders_accurate_mul",       false));
-            setSpinner(frameLimit,  getInt(ini, "Renderer", "frame_limit",                 100));
-            setCombo(textureFilter, get(ini, "Renderer", "texture_filter_name",       "None"));
+            // Graphics — graphics_api is an integer: 0=OpenGL, 2=Vulkan
+            int apiInt = getInt(ini,"Renderer","graphics_api",2);
+            setCombo(graphicsAPI, apiInt == 0 ? "OpenGL" : "Vulkan");
+            setSpinner(resFactor,    getInt(ini,"Renderer","resolution_factor",1));
+            setCheck(integerScaling, getBool(ini,"Renderer","use_integer_scaling",false));
+            setCheck(vsync,          getBool(ini,"Renderer","use_vsync_new",true));
+            setSpinner(frameLimit,   getInt(ini,"Renderer","frame_limit",100));
+            setCheck(hwShaders,      getBool(ini,"Renderer","use_hw_shader",true));
+            setCheck(asyncShaders,   getBool(ini,"Renderer","async_shader_compilation",true));
+            setCheck(shaderJIT,      getBool(ini,"Renderer","use_shader_jit",true));
+            setCheck(accurateMul,    getBool(ini,"Renderer","shaders_accurate_mul",false));
+            setCheck(simulate3DSGPU, getBool(ini,"Renderer","simulate_3ds_gpu_timings",false));
+            setCombo(texFilter,      get(ini,"Renderer","texture_filter_name","None"));
+            setSpinner(aaSamples,    getInt(ini,"Renderer","anti_aliasing_samples",1));
+            setCheck(linearFilter,   getBool(ini,"Renderer","filter_mode",false));
+            setCheck(disableRightEye,getBool(ini,"Renderer","disable_right_eye_render",false));
+            // disk shader cache is under [Renderer]
+            setCheck(diskShaderCache,getBool(ini,"Renderer","use_disk_shader_cache",true));
 
             // Layout
-            setCombo(layoutOption, layoutIndexToName(getInt(ini, "Layout", "layout_option", 0)));
-            setCheck(swapScreens,  getBool(ini, "Layout", "swap_screen",            false));
-            setSpinner(screenGap,  getInt(ini, "Layout", "screen_gap",              0));
-            // large_screen_proportion is a float like 2.25 → store as 225 in spinner
-            double lsp = getDouble(ini, "Layout", "large_screen_proportion", 2.25);
-            setSpinner(largeScreenProportion, (int) Math.round(lsp * 100));
+            setCombo(layout,         layoutIdxToName(getInt(ini,"Layout","layout_option",0)));
+            setCheck(swapScreens,    getBool(ini,"Layout","swap_screen",false));
+            setSpinner(screenGap,    getInt(ini,"Layout","screen_gap",0));
+            setSpinner(largeScreenRatio,(int)Math.round(getDouble(ini,"Layout","large_screen_proportion",2.25)*100));
+            setCheck(portrait,       getBool(ini,"Layout","upright_screen",false));
+            setCheck(hideMouseInactive,getBool(ini,"Layout","hide_inactivemouse",false));
 
-        } catch (IOException e) {
-            showStatus("Error reading config: " + e.getMessage(), TEXT_WARN);
-            applyDefaults();
-        }
+            // System tab extras — all under [System]
+            setCombo(region,         regionIdxToName(getInt(ini,"System","region_value",-1)));
+            setCheck(regionFree,     getBool(ini,"System","apply_region_free_patch",false));
+            setCheck(sharedFont,     getBool(ini,"System","use_shared_font",true));
+            setCheck(pluginLoader,   getBool(ini,"System","plugin_loader",false));
+
+            // DataStorage
+            setCheck(useVirtualSD,   getBool(ini,"DataStorage","use_virtual_sd",true));
+
+            // Camera
+            setCombo(camInner,  camVal(get(ini,"Camera","inner_name","blank")));
+            setCombo(camOuterL, camVal(get(ini,"Camera","outer_left_name","blank")));
+            setCombo(camOuterR, camVal(get(ini,"Camera","outer_right_name","blank")));
+
+            // Mic — under [Audio]
+            setCheck(micEnabled, getBool(ini,"Audio","mic_enabled",false));
+            setCombo(audioIn,    get(ini,"Audio","input_device","auto"));
+
+            // Network — [Network] section
+            setCheck(enableNetwork,  getBool(ini,"Network","enable_network",false));
+            networkInterface.setText(get(ini,"Network","network_interface",""));
+
+        } catch (IOException e) { applyDefaults(); }
     }
 
     private void saveConfig() {
-        // Build the set of values to write
-        Map<String, Map<String, String>> writes = new LinkedHashMap<>();
-        putW(writes, "Audio",    "audio_emulation",          getCombo(audioMode));
-        putW(writes, "Audio",    "enable_audio_stretching",  bool(audioStretching));
-        putW(writes, "Audio",    "enable_realtime",           bool(audioRealtime));
-        putW(writes, "System",   "is_new_3ds",               bool(isNew3DS));
-        putW(writes, "System",   "lle_applets",              bool(lleApplets));
-        putW(writes, "System",   "region_value",             String.valueOf(regionNameToIndex(getCombo(regionValue))));
-        putW(writes, "Core",     "cpu_clock_percentage",     String.valueOf(getSpinnerInt(cpuClock)));
-        putW(writes, "Renderer", "resolution_factor",        String.valueOf(getSpinnerInt(resolutionFactor)));
-        putW(writes, "Renderer", "use_vsync_new",            bool(vsync));
-        putW(writes, "Renderer", "async_shader_compilation", bool(asyncShaders));
-        putW(writes, "Renderer", "use_hw_shader",            bool(hwShaders));
-        putW(writes, "Renderer", "use_shader_jit",           bool(shaderJIT));
-        putW(writes, "Renderer", "shaders_accurate_mul",     bool(accurateMul));
-        putW(writes, "Renderer", "frame_limit",              String.valueOf(getSpinnerInt(frameLimit)));
-        putW(writes, "Renderer", "texture_filter_name",      getCombo(textureFilter));
-        putW(writes, "Layout",   "layout_option",            String.valueOf(layoutNameToIndex(getCombo(layoutOption))));
-        putW(writes, "Layout",   "swap_screen",              bool(swapScreens));
-        putW(writes, "Layout",   "screen_gap",               String.valueOf(getSpinnerInt(screenGap)));
-        // Convert spinner value (int ×100) back to float string
-        double lsp = getSpinnerInt(largeScreenProportion) / 100.0;
-        putW(writes, "Layout",   "large_screen_proportion",  String.format("%.2f", lsp));
+        // Merge both tab instances
+        boolean n3ds = isNew3DS.isSelected() || isNew3DS_sys.isSelected();
+        boolean lle  = lleApplets.isSelected() || lleApplets_sys.isSelected();
 
-        // Merge into rawLines (same algorithm as CitraLauncher.applyGameOverrides)
-        List<String> result = new ArrayList<>();
-        Set<String> applied = new HashSet<>();
-        String currentSection = "";
+        Map<String,Map<String,String>> w = new LinkedHashMap<>();
 
-        if (rawLines.isEmpty()) {
-            // Fresh config — build from scratch
-            result = buildFreshConfig(writes);
-        } else {
-            for (String line : rawLines) {
-                String trimmed = line.trim();
-                if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-                    currentSection = trimmed.substring(1, trimmed.length() - 1).trim();
-                    result.add(line);
-                    continue;
-                }
-                if (trimmed.contains("=") && !trimmed.startsWith(";") && !trimmed.startsWith("#")) {
-                    String lineKey = trimmed.substring(0, trimmed.indexOf('=')).trim();
-                    Map<String, String> sec = writes.get(currentSection);
-                    if (sec != null && sec.containsKey(lineKey)) {
-                        result.add(lineKey + " = " + sec.get(lineKey));
-                        applied.add(currentSection + "/" + lineKey);
-                        continue;
-                    }
-                }
-                result.add(line);
-            }
-            // Append any keys not yet in the file
-            for (Map.Entry<String, Map<String, String>> se : writes.entrySet()) {
-                String section = se.getKey();
-                for (Map.Entry<String, String> kv : se.getValue().entrySet()) {
-                    if (applied.contains(section + "/" + kv.getKey())) continue;
-                    // Find section and insert, or create section
-                    boolean found = false;
-                    int insertAt = -1;
-                    for (int i = 0; i < result.size(); i++) {
-                        String t = result.get(i).trim();
-                        if (t.equals("[" + section + "]")) found = true;
-                        else if (found && t.startsWith("[") && t.endsWith("]")) { insertAt = i; break; }
-                    }
-                    if (found && insertAt == -1) insertAt = result.size();
-                    if (found) {
-                        result.add(insertAt, kv.getKey() + " = " + kv.getValue());
-                    } else {
-                        result.add(""); result.add("[" + section + "]");
-                        result.add(kv.getKey() + " = " + kv.getValue());
-                    }
-                }
-            }
-        }
+        // [Audio]
+        putW(w,"Audio","audio_emulation",            getCombo(audioMode));
+        putW(w,"Audio","enable_audio_stretching",    bool(audioStretch));
+        putW(w,"Audio","enable_realtime",            bool(audioRT));
+        putW(w,"Audio","mic_enabled",                bool(micEnabled));
+        putW(w,"Audio","input_device",               getCombo(audioIn));
 
+        // [Core]
+        putW(w,"Core","cpu_clock_percentage",        String.valueOf(getSpinnerInt(cpuClock)));
+
+        // [System]
+        putW(w,"System","is_new_3ds",                String.valueOf(n3ds));
+        putW(w,"System","lle_applets",               String.valueOf(lle));
+        putW(w,"System","region_value",              String.valueOf(regionNameToIdx(getCombo(region))));
+        putW(w,"System","apply_region_free_patch",   bool(regionFree));
+        putW(w,"System","use_shared_font",           bool(sharedFont));
+        putW(w,"System","plugin_loader",             bool(pluginLoader));
+
+        // [Renderer] — graphics_api as integer, disk_shader_cache here
+        putW(w,"Renderer","graphics_api",            getCombo(graphicsAPI).equals("Vulkan") ? "2" : "0");
+        putW(w,"Renderer","resolution_factor",       String.valueOf(getSpinnerInt(resFactor)));
+        putW(w,"Renderer","use_integer_scaling",     bool(integerScaling));
+        putW(w,"Renderer","use_vsync_new",           bool(vsync));
+        putW(w,"Renderer","frame_limit",             String.valueOf(getSpinnerInt(frameLimit)));
+        putW(w,"Renderer","use_hw_shader",           bool(hwShaders));
+        putW(w,"Renderer","async_shader_compilation",bool(asyncShaders));
+        putW(w,"Renderer","use_shader_jit",          bool(shaderJIT));
+        putW(w,"Renderer","shaders_accurate_mul",    bool(accurateMul));
+        putW(w,"Renderer","simulate_3ds_gpu_timings",bool(simulate3DSGPU));
+        putW(w,"Renderer","texture_filter_name",     getCombo(texFilter));
+        putW(w,"Renderer","anti_aliasing_samples",   String.valueOf(getSpinnerInt(aaSamples)));
+        putW(w,"Renderer","filter_mode",             bool(linearFilter));
+        putW(w,"Renderer","disable_right_eye_render",bool(disableRightEye));
+        putW(w,"Renderer","use_disk_shader_cache",   bool(diskShaderCache));
+
+        // [Layout]
+        putW(w,"Layout","layout_option",             String.valueOf(layoutNameToIdx(getCombo(layout))));
+        putW(w,"Layout","swap_screen",               bool(swapScreens));
+        putW(w,"Layout","screen_gap",                String.valueOf(getSpinnerInt(screenGap)));
+        putW(w,"Layout","large_screen_proportion",   String.format("%.2f",getSpinnerInt(largeScreenRatio)/100.0));
+        putW(w,"Layout","upright_screen",            bool(portrait));
+        putW(w,"Layout","hide_inactivemouse",        bool(hideMouseInactive));
+
+        // [DataStorage]
+        putW(w,"DataStorage","use_virtual_sd",       bool(useVirtualSD));
+
+        // [Camera]
+        putW(w,"Camera","inner_name",                camKey(getCombo(camInner)));
+        putW(w,"Camera","outer_left_name",           camKey(getCombo(camOuterL)));
+        putW(w,"Camera","outer_right_name",          camKey(getCombo(camOuterR)));
+
+        // [Network]
+        putW(w,"Network","enable_network",           bool(enableNetwork));
+        putW(w,"Network","network_interface",        networkInterface.getText().trim());
+
+        List<String> result = rawLines.isEmpty() ? freshConfig(w) : mergeConfig(rawLines,w);
         try {
-            File configFile = new File(CONFIG_PATH);
-            configFile.getParentFile().mkdirs();
-            Files.write(configFile.toPath(), result);
-            System.out.println("✓ Config saved to " + CONFIG_PATH);
-        } catch (IOException e) {
+            File cf = new File(CONFIG_PATH); cf.getParentFile().mkdirs();
+            Files.write(cf.toPath(), result);
             JOptionPane.showMessageDialog(this,
-                "Failed to save config:\n" + e.getMessage(),
-                "Save Error", JOptionPane.ERROR_MESSAGE);
+                "Settings saved!\nRestart the emulator for Graphics and Layout changes to take effect.",
+                "Saved", JOptionPane.INFORMATION_MESSAGE);
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(this,"Save failed: "+e.getMessage(),"Error",JOptionPane.ERROR_MESSAGE);
         }
     }
 
-    private List<String> buildFreshConfig(Map<String, Map<String, String>> writes) {
-        List<String> out = new ArrayList<>();
-        out.add("# Azahar configuration — generated by AzaharSettings");
-        out.add("");
-        for (Map.Entry<String, Map<String, String>> se : writes.entrySet()) {
-            out.add("[" + se.getKey() + "]");
-            for (Map.Entry<String, String> kv : se.getValue().entrySet()) {
-                out.add(kv.getKey() + " = " + kv.getValue());
-            }
-            out.add("");
-        }
-        return out;
-    }
-
-    // -----------------------------------------------------------------------
-    // INI parsing helpers
-    // -----------------------------------------------------------------------
-    private Map<String, Map<String, String>> parseIni(List<String> lines) {
-        Map<String, Map<String, String>> result = new LinkedHashMap<>();
-        String section = "";
+    private List<String> mergeConfig(List<String> lines, Map<String,Map<String,String>> w) {
+        List<String> result = new ArrayList<>(); Set<String> applied = new HashSet<>(); String sec="";
         for (String line : lines) {
-            String t = line.trim();
-            if (t.startsWith("[") && t.endsWith("]")) {
-                section = t.substring(1, t.length() - 1).trim();
-                result.computeIfAbsent(section, k -> new LinkedHashMap<>());
-            } else if (t.contains("=") && !t.startsWith(";") && !t.startsWith("#")) {
-                int eq = t.indexOf('=');
-                String k = t.substring(0, eq).trim();
-                String v = t.substring(eq + 1).trim();
-                result.computeIfAbsent(section, s -> new LinkedHashMap<>()).put(k, v);
+            String t=line.trim();
+            if (t.startsWith("[")&&t.endsWith("]")) { sec=t.substring(1,t.length()-1).trim(); result.add(line); continue; }
+            if (t.contains("=")&&!t.startsWith(";")&&!t.startsWith("#")) {
+                String k=t.substring(0,t.indexOf('=')).trim(); Map<String,String> ws=w.get(sec);
+                if (ws!=null&&ws.containsKey(k)) { result.add(k+" = "+ws.get(k)); applied.add(sec+"/"+k); continue; }
+            }
+            result.add(line);
+        }
+        for (Map.Entry<String,Map<String,String>> se : w.entrySet()) {
+            for (Map.Entry<String,String> kv : se.getValue().entrySet()) {
+                if (applied.contains(se.getKey()+"/"+kv.getKey())) continue;
+                boolean found=false; int at=-1;
+                for (int i=0;i<result.size();i++) { String t=result.get(i).trim();
+                    if (t.equals("["+se.getKey()+"]")) found=true;
+                    else if (found&&t.startsWith("[")&&t.endsWith("]")){at=i;break;} }
+                if (found&&at==-1) at=result.size();
+                if (found) result.add(at,kv.getKey()+" = "+kv.getValue());
+                else { result.add(""); result.add("["+se.getKey()+"]"); result.add(kv.getKey()+" = "+kv.getValue()); }
             }
         }
         return result;
     }
 
-    private String get(Map<String, Map<String, String>> ini, String sec, String key, String def) {
-        Map<String, String> s = ini.get(sec);
-        return s != null && s.containsKey(key) ? s.get(key) : def;
-    }
-    private boolean getBool(Map<String, Map<String, String>> ini, String sec, String key, boolean def) {
-        String v = get(ini, sec, key, null);
-        if (v == null) return def;
-        return v.equalsIgnoreCase("true") || v.equals("1");
-    }
-    private int getInt(Map<String, Map<String, String>> ini, String sec, String key, int def) {
-        String v = get(ini, sec, key, null);
-        try { return v != null ? Integer.parseInt(v) : def; } catch (NumberFormatException e) { return def; }
-    }
-    private double getDouble(Map<String, Map<String, String>> ini, String sec, String key, double def) {
-        String v = get(ini, sec, key, null);
-        try { return v != null ? Double.parseDouble(v) : def; } catch (NumberFormatException e) { return def; }
-    }
-    private void putW(Map<String, Map<String, String>> m, String sec, String key, String val) {
-        m.computeIfAbsent(sec, k -> new LinkedHashMap<>()).put(key, val);
-    }
-    private String bool(JCheckBox cb) { return cb.isSelected() ? "true" : "false"; }
-    private int getSpinnerInt(JSpinner s) { return (Integer) s.getValue(); }
-    private String getCombo(JComboBox<String> c) { return (String) c.getSelectedItem(); }
-
-    // -----------------------------------------------------------------------
-    // Enum mappings
-    // -----------------------------------------------------------------------
-    private String regionIndexToName(int idx) {
-        String[] names = {"Auto","Japan","USA","Europe","Australia","China","Korea","Taiwan"};
-        // -1 = Auto, 0 = Japan, …
-        int adj = idx + 1;
-        return (adj >= 0 && adj < names.length) ? names[adj] : "Auto";
-    }
-    private int regionNameToIndex(String name) {
-        String[] names = {"Auto","Japan","USA","Europe","Australia","China","Korea","Taiwan"};
-        for (int i = 0; i < names.length; i++) if (names[i].equals(name)) return i - 1;
-        return -1;
-    }
-    private String layoutIndexToName(int idx) {
-        String[] names = {"Default","Single Screen","Large Screen","Side by Side","Medium Screen"};
-        return (idx >= 0 && idx < names.length) ? names[idx] : "Default";
-    }
-    private int layoutNameToIndex(String name) {
-        String[] names = {"Default","Single Screen","Large Screen","Side by Side","Medium Screen"};
-        for (int i = 0; i < names.length; i++) if (names[i].equals(name)) return i;
-        return 0;
+    private List<String> freshConfig(Map<String,Map<String,String>> w) {
+        List<String> o=new ArrayList<>(); o.add("# Azahar config"); o.add("");
+        for (Map.Entry<String,Map<String,String>> se:w.entrySet()) {
+            o.add("["+se.getKey()+"]");
+            for (Map.Entry<String,String> kv:se.getValue().entrySet()) o.add(kv.getKey()+" = "+kv.getValue());
+            o.add("");
+        }
+        return o;
     }
 
-    // -----------------------------------------------------------------------
-    // Widget helpers
-    // -----------------------------------------------------------------------
-    private void setCombo(JComboBox<String> c, String val) {
-        for (int i = 0; i < c.getItemCount(); i++)
-            if (c.getItemAt(i).equals(val)) { c.setSelectedIndex(i); return; }
-        c.setSelectedIndex(0);
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private Map<String,Map<String,String>> parseIni(List<String> lines) {
+        Map<String,Map<String,String>> r=new LinkedHashMap<>(); String sec="";
+        for (String line:lines) { String t=line.trim();
+            if (t.startsWith("[")&&t.endsWith("]")) { sec=t.substring(1,t.length()-1).trim(); r.computeIfAbsent(sec,k->new LinkedHashMap<>()); }
+            else if (t.contains("=")&&!t.startsWith(";")&&!t.startsWith("#")) {
+                int eq=t.indexOf('='); r.computeIfAbsent(sec,s->new LinkedHashMap<>()).put(t.substring(0,eq).trim(),t.substring(eq+1).trim()); }
+        } return r;
     }
-    private void setCheck(JCheckBox cb, boolean v) { cb.setSelected(v); }
-    private void setSpinner(JSpinner s, int v) {
-        SpinnerNumberModel m = (SpinnerNumberModel) s.getModel();
-        int min = ((Number) m.getMinimum()).intValue();
-        int max = ((Number) m.getMaximum()).intValue();
-        s.setValue(Math.max(min, Math.min(max, v)));
+    private String  get(Map<String,Map<String,String>> i,String s,String k,String d)  { Map<String,String> m=i.get(s); return m!=null&&m.containsKey(k)?m.get(k):d; }
+    private boolean getBool(Map<String,Map<String,String>> i,String s,String k,boolean d) { String v=get(i,s,k,null); return v==null?d:v.equalsIgnoreCase("true")||v.equals("1"); }
+    private int     getInt(Map<String,Map<String,String>> i,String s,String k,int d)   { String v=get(i,s,k,null); try{return v!=null?Integer.parseInt(v):d;}catch(Exception e){return d;} }
+    private double  getDouble(Map<String,Map<String,String>> i,String s,String k,double d){ String v=get(i,s,k,null); try{return v!=null?Double.parseDouble(v):d;}catch(Exception e){return d;} }
+    private void    putW(Map<String,Map<String,String>> m,String s,String k,String v)  { m.computeIfAbsent(s,x->new LinkedHashMap<>()).put(k,v); }
+    private String  bool(JCheckBox cb) { return cb.isSelected()?"true":"false"; }
+    private int     getSpinnerInt(JSpinner s) { return (Integer)s.getValue(); }
+    private String  getCombo(JComboBox<String> c) { return (String)c.getSelectedItem(); }
+
+    private String camVal(String raw) {
+        if (raw.equals("blank")) return "blank (disabled)";
+        if (raw.equals("opencv")) return "opencv (webcam)";
+        if (raw.equals("image")) return "image (static image)";
+        return raw;
     }
+    private String camKey(String display) { return display.split(" ")[0]; }
+
+    private String regionIdxToName(int idx) {
+        String[] n={"Auto","Japan","USA","Europe","Australia","China","Korea","Taiwan"};
+        int a=idx+1; return (a>=0&&a<n.length)?n[a]:"Auto";
+    }
+    private int regionNameToIdx(String name) {
+        String[] n={"Auto","Japan","USA","Europe","Australia","China","Korea","Taiwan"};
+        for(int i=0;i<n.length;i++) if(n[i].equals(name)) return i-1; return -1;
+    }
+    private String layoutIdxToName(int idx) {
+        String[] n={"Default","Single Screen","Large Screen","Side by Side","Medium Screen","Separate Windows"};
+        return (idx>=0&&idx<n.length)?n[idx]:"Default";
+    }
+    private int layoutNameToIdx(String name) {
+        String[] n={"Default","Single Screen","Large Screen","Side by Side","Medium Screen","Separate Windows"};
+        for(int i=0;i<n.length;i++) if(n[i].equals(name)) return i; return 0;
+    }
+
+    private void setCombo(JComboBox<String> c,String val) {
+        for(int i=0;i<c.getItemCount();i++) if(c.getItemAt(i).equals(val)){c.setSelectedIndex(i);return;} c.setSelectedIndex(0);
+    }
+    private void setCheck(JCheckBox cb,boolean v){cb.setSelected(v);}
+    private void setSpinner(JSpinner s,int v){SpinnerNumberModel m=(SpinnerNumberModel)s.getModel();int mn=((Number)m.getMinimum()).intValue(),mx=((Number)m.getMaximum()).intValue();s.setValue(Math.max(mn,Math.min(mx,v)));}
 
     private void applyDefaults() {
-        setCombo(audioMode, "HLE"); setCheck(audioStretching, true); setCheck(audioRealtime, false);
-        setCheck(isNew3DS, true); setCheck(lleApplets, true);
-        setCombo(regionValue, "Auto"); setSpinner(cpuClock, 100);
-        setSpinner(resolutionFactor, 1); setCheck(vsync, true);
-        setCheck(asyncShaders, true); setCheck(hwShaders, true);
-        setCheck(shaderJIT, true); setCheck(accurateMul, false);
-        setSpinner(frameLimit, 100); setCombo(textureFilter, "None");
-        setCombo(layoutOption, "Default"); setCheck(swapScreens, false);
-        setSpinner(screenGap, 0); setSpinner(largeScreenProportion, 225);
+        setCombo(audioMode,"HLE");setCheck(audioStretch,true);setCheck(audioRT,false);
+        setCheck(isNew3DS,true);setCheck(isNew3DS_sys,true);setCheck(lleApplets,true);setCheck(lleApplets_sys,true);setSpinner(cpuClock,100);
+        setCombo(graphicsAPI,"Vulkan");setSpinner(resFactor,1);setCheck(integerScaling,false);setCheck(vsync,true);setSpinner(frameLimit,100);
+        setCheck(hwShaders,true);setCheck(asyncShaders,true);setCheck(shaderJIT,true);setCheck(accurateMul,false);setCheck(simulate3DSGPU,false);
+        setCombo(texFilter,"None");setSpinner(aaSamples,1);setCheck(linearFilter,false);setCheck(disableRightEye,false);setCheck(diskShaderCache,true);
+        setCombo(layout,"Default");setCheck(swapScreens,false);setSpinner(screenGap,0);setSpinner(largeScreenRatio,225);setCheck(portrait,false);setCheck(hideMouseInactive,false);
+        setCombo(region,"Auto");setCheck(regionFree,false);setCheck(sharedFont,true);setCheck(pluginLoader,false);setCheck(useVirtualSD,true);
+        setCombo(camInner,"blank (disabled)");setCombo(camOuterL,"blank (disabled)");setCombo(camOuterR,"blank (disabled)");
+        setCheck(micEnabled,false);setCombo(audioIn,"auto");setCheck(enableNetwork,false);networkInterface.setText("");
     }
 
-    // -----------------------------------------------------------------------
-    // Layout / styling helpers
-    // -----------------------------------------------------------------------
-    private JPanel tabPanel() {
-        JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
-        p.setBackground(BG);
-        p.setBorder(BorderFactory.createEmptyBorder(16, 20, 16, 20));
-        return p;
+    // ── Swing helpers ─────────────────────────────────────────────────────────
+
+    private JPanel tabPanel(){JPanel p=new JPanel();p.setLayout(new BoxLayout(p,BoxLayout.Y_AXIS));p.setBackground(BG);p.setBorder(BorderFactory.createEmptyBorder(16,20,16,20));return p;}
+
+    private void addSectionHeader(JPanel parent,String title){
+        if(parent.getComponentCount()>0)parent.add(Box.createVerticalStrut(12));
+        JLabel l=new JLabel(title.toUpperCase());l.setFont(new Font("Menlo",Font.BOLD,10));l.setForeground(ACCENT);l.setAlignmentX(Component.LEFT_ALIGNMENT);
+        l.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createMatteBorder(0,0,1,0,BORDER_SUB),BorderFactory.createEmptyBorder(0,0,6,0)));
+        l.setMaximumSize(new Dimension(Integer.MAX_VALUE,l.getPreferredSize().height+8));parent.add(l);parent.add(Box.createVerticalStrut(4));
     }
 
-    private void addSectionHeader(JPanel parent, String title) {
-        if (parent.getComponentCount() > 0) parent.add(Box.createVerticalStrut(12));
-        JLabel lbl = new JLabel(title.toUpperCase());
-        lbl.setFont(new Font("Menlo", Font.BOLD, 10));
-        lbl.setForeground(ACCENT);
-        lbl.setAlignmentX(Component.LEFT_ALIGNMENT);
-        lbl.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_SUB),
-            BorderFactory.createEmptyBorder(0, 0, 6, 0)
-        ));
-        lbl.setMaximumSize(new Dimension(Integer.MAX_VALUE, lbl.getPreferredSize().height + 8));
-        parent.add(lbl);
-        parent.add(Box.createVerticalStrut(4));
+    private void addRow(JPanel parent,String labelText,String tip,JComponent control){
+        JPanel row=new JPanel(new BorderLayout(12,0));row.setBackground(BG_PANEL);row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE,52));
+        row.setBorder(new CompoundBorder(BorderFactory.createMatteBorder(0,0,1,0,BORDER_SUB),BorderFactory.createEmptyBorder(8,12,8,12)));
+        JPanel lb=new JPanel(new BorderLayout(0,2));lb.setOpaque(false);
+        JLabel n=new JLabel(labelText);n.setFont(new Font("Menlo",Font.PLAIN,13));n.setForeground(TEXT_MAIN);
+        JLabel h=new JLabel(tip);h.setFont(new Font("Menlo",Font.PLAIN,10));h.setForeground(TEXT_DIM);
+        lb.add(n,BorderLayout.NORTH);lb.add(h,BorderLayout.SOUTH);styleControl(control);
+        row.add(lb,BorderLayout.CENTER);row.add(control,BorderLayout.EAST);parent.add(row);parent.add(Box.createVerticalStrut(2));
     }
 
-    private void addRow(JPanel parent, String label, String tooltip, JComponent control) {
-        JPanel row = new JPanel(new BorderLayout(12, 0));
-        row.setBackground(BG_PANEL);
-        row.setAlignmentX(Component.LEFT_ALIGNMENT);
-        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 52));
-        row.setBorder(new CompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_SUB),
-            BorderFactory.createEmptyBorder(8, 12, 8, 12)
-        ));
-
-        // Left: label + tooltip
-        JPanel labelBox = new JPanel(new BorderLayout(0, 2));
-        labelBox.setOpaque(false);
-        JLabel nameLabel = new JLabel(label);
-        nameLabel.setFont(new Font("Menlo", Font.PLAIN, 13));
-        nameLabel.setForeground(TEXT_MAIN);
-        String shortTip = tooltip.split("\n")[0];
-        JLabel tipLabel = new JLabel(shortTip);
-        tipLabel.setFont(new Font("Menlo", Font.PLAIN, 10));
-        tipLabel.setForeground(TEXT_DIM);
-        labelBox.add(nameLabel, BorderLayout.NORTH);
-        labelBox.add(tipLabel, BorderLayout.SOUTH);
-        row.setToolTipText("<html>" + tooltip.replace("\n", "<br>") + "</html>");
-
-        // Right: control
-        styleControl(control);
-
-        row.add(labelBox, BorderLayout.CENTER);
-        row.add(control, BorderLayout.EAST);
-        parent.add(row);
-        parent.add(Box.createVerticalStrut(2));
+    private JLabel note(String text){
+        JLabel l=new JLabel("<html>"+text.replace("\n","<br>")+"</html>");
+        l.setFont(new Font("Menlo",Font.PLAIN,10));l.setForeground(TEXT_DIM);l.setAlignmentX(Component.LEFT_ALIGNMENT);return l;
     }
+    private JLabel lbl(String text,Color color){JLabel l=new JLabel(text);l.setFont(new Font("Menlo",Font.PLAIN,11));l.setForeground(color);return l;}
 
-    private void styleControl(JComponent c) {
-        c.setFont(new Font("Menlo", Font.PLAIN, 12));
-        if (c instanceof JComboBox) {
-            JComboBox<?> cb = (JComboBox<?>) c;
-            cb.setBackground(BG_FIELD);
-            cb.setForeground(TEXT_MAIN);
-            cb.setPreferredSize(new Dimension(180, 28));
-        } else if (c instanceof JCheckBox) {
-            JCheckBox chk = (JCheckBox) c;
-            chk.setOpaque(false);
-            chk.setForeground(TEXT_MAIN);
-            chk.setPreferredSize(new Dimension(60, 28));
-            chk.setHorizontalAlignment(SwingConstants.RIGHT);
-        } else if (c instanceof JSpinner) {
-            JSpinner sp = (JSpinner) c;
-            sp.setPreferredSize(new Dimension(100, 28));
-            sp.setBackground(BG_FIELD);
-            sp.getEditor().setBackground(BG_FIELD);
-            if (sp.getEditor() instanceof JSpinner.DefaultEditor) {
-                JTextField tf = ((JSpinner.DefaultEditor) sp.getEditor()).getTextField();
-                tf.setBackground(BG_FIELD);
-                tf.setForeground(TEXT_MAIN);
-                tf.setCaretColor(TEXT_MAIN);
-                tf.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
-            }
-        }
-    }
+    private void styleControl(JComponent c){c.setFont(new Font("Menlo",Font.PLAIN,12));
+        if(c instanceof JComboBox){JComboBox<?> cb=(JComboBox<?>)c;cb.setBackground(BG_FIELD);cb.setForeground(TEXT_MAIN);cb.setPreferredSize(new Dimension(210,28));}
+        else if(c instanceof JCheckBox){JCheckBox chk=(JCheckBox)c;chk.setOpaque(false);chk.setForeground(TEXT_MAIN);chk.setPreferredSize(new Dimension(60,28));chk.setHorizontalAlignment(SwingConstants.RIGHT);}
+        else if(c instanceof JSpinner){JSpinner sp=(JSpinner)c;sp.setPreferredSize(new Dimension(100,28));sp.setBackground(BG_FIELD);sp.getEditor().setBackground(BG_FIELD);
+            if(sp.getEditor() instanceof JSpinner.DefaultEditor){JTextField tf=((JSpinner.DefaultEditor)sp.getEditor()).getTextField();tf.setBackground(BG_FIELD);tf.setForeground(TEXT_MAIN);tf.setCaretColor(TEXT_MAIN);tf.setBorder(BorderFactory.createEmptyBorder(2,6,2,6));}}}
 
-    private void styleTabPane(JTabbedPane tabs) {
-        tabs.setFont(new Font("Menlo", Font.PLAIN, 12));
-        tabs.setBorder(BorderFactory.createEmptyBorder());
-        UIManager.put("TabbedPane.selected",         BG_PANEL);
-        UIManager.put("TabbedPane.background",        BG);
-        UIManager.put("TabbedPane.foreground",        TEXT_MAIN);
-        UIManager.put("TabbedPane.contentBorderInsets", new Insets(0,0,0,0));
-    }
+    private void styleTabPane(JTabbedPane tabs){tabs.setFont(new Font("Menlo",Font.PLAIN,12));tabs.setBorder(BorderFactory.createEmptyBorder());
+        UIManager.put("TabbedPane.selected",BG_PANEL);UIManager.put("TabbedPane.background",BG);UIManager.put("TabbedPane.foreground",TEXT_MAIN);UIManager.put("TabbedPane.contentBorderInsets",new Insets(0,0,0,0));}
 
-    private JButton styledButton(String text, Color bg, Color fg) {
-        JButton btn = new JButton(text) {
-            @Override protected void paintComponent(Graphics g) {
-                Graphics2D g2 = (Graphics2D) g.create();
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                Color c = getModel().isRollover() ?
-                    bg.brighter() : bg;
-                g2.setColor(c);
-                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
-                g2.dispose();
-                super.paintComponent(g);
-            }
-        };
-        btn.setFont(new Font("Menlo", Font.PLAIN, 13));
-        btn.setForeground(fg);
-        btn.setOpaque(false);
-        btn.setContentAreaFilled(false);
-        btn.setBorderPainted(false);
-        btn.setFocusPainted(false);
-        btn.setBorder(BorderFactory.createEmptyBorder(8, 18, 8, 18));
-        btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        return btn;
-    }
+    private JButton styledButton(String text,Color bg,Color fg){
+        JButton btn=new JButton(text){@Override protected void paintComponent(Graphics g){Graphics2D g2=(Graphics2D)g.create();g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,RenderingHints.VALUE_ANTIALIAS_ON);g2.setColor(getModel().isRollover()?bg.brighter():bg);g2.fillRoundRect(0,0,getWidth(),getHeight(),8,8);g2.dispose();super.paintComponent(g);}};
+        btn.setFont(new Font("Menlo",Font.PLAIN,13));btn.setForeground(fg);btn.setOpaque(false);btn.setContentAreaFilled(false);btn.setBorderPainted(false);btn.setFocusPainted(false);btn.setBorder(BorderFactory.createEmptyBorder(8,18,8,18));btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));return btn;}
 
-    private JComboBox<String> combo(String... items) {
-        return new JComboBox<>(items);
-    }
-    private JCheckBox check() { return new JCheckBox(); }
-    private JSpinner spinner(int val, int min, int max, int step) {
-        return new JSpinner(new SpinnerNumberModel(val, min, max, step));
-    }
+    private JComboBox<String> combo(String...items){return new JComboBox<>(items);}
+    private JCheckBox check(){return new JCheckBox();}
+    private JSpinner spinner(int val,int min,int max,int step){return new JSpinner(new SpinnerNumberModel(val,min,max,step));}
 
-    private void showStatus(String msg, Color color) {
-        System.out.println(msg);
-    }
-
-    // -----------------------------------------------------------------------
-    // Entry point
-    // -----------------------------------------------------------------------
-    public static void main(String[] args) {
-        // Apply dark UI hints before creating any Swing components
-        try {
-            UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName());
-        } catch (Exception ignored) {}
-
-        UIManager.put("Panel.background",         new Color(0x18, 0x18, 0x1E));
-        UIManager.put("OptionPane.background",     new Color(0x18, 0x18, 0x1E));
-        UIManager.put("OptionPane.messageForeground", new Color(0xE8, 0xE8, 0xF0));
-        UIManager.put("ScrollPane.background",     new Color(0x18, 0x18, 0x1E));
-        UIManager.put("Viewport.background",       new Color(0x18, 0x18, 0x1E));
-        UIManager.put("TabbedPane.background",     new Color(0x18, 0x18, 0x1E));
-        UIManager.put("TabbedPane.foreground",     new Color(0xE8, 0xE8, 0xF0));
-        UIManager.put("TabbedPane.selected",       new Color(0x22, 0x22, 0x2C));
-        UIManager.put("ComboBox.background",       new Color(0x2A, 0x2A, 0x38));
-        UIManager.put("ComboBox.foreground",       new Color(0xE8, 0xE8, 0xF0));
-        UIManager.put("ComboBox.selectionBackground", new Color(0x5B, 0xAD, 0xFF));
-        UIManager.put("ComboBox.selectionForeground", new Color(0x10, 0x10, 0x16));
-        UIManager.put("List.background",           new Color(0x2A, 0x2A, 0x38));
-        UIManager.put("List.foreground",           new Color(0xE8, 0xE8, 0xF0));
-        UIManager.put("List.selectionBackground",  new Color(0x5B, 0xAD, 0xFF));
-        UIManager.put("List.selectionForeground",  new Color(0x10, 0x10, 0x16));
-
-        SwingUtilities.invokeLater(() -> {
-            AzaharSettings win = new AzaharSettings();
-            win.setVisible(true);
-        });
+    public static void main(String[] args){
+        try{UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName());}catch(Exception ignored){}
+        UIManager.put("Panel.background",new Color(0x18,0x18,0x1E));UIManager.put("OptionPane.background",new Color(0x18,0x18,0x1E));
+        UIManager.put("OptionPane.messageForeground",new Color(0xE8,0xE8,0xF0));UIManager.put("ComboBox.background",new Color(0x2A,0x2A,0x38));
+        UIManager.put("ComboBox.foreground",new Color(0xE8,0xE8,0xF0));UIManager.put("List.background",new Color(0x2A,0x2A,0x38));UIManager.put("List.foreground",new Color(0xE8,0xE8,0xF0));
+        SwingUtilities.invokeLater(()->new AzaharSettings().setVisible(true));
     }
 }

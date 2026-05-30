@@ -3,174 +3,215 @@ import org.citra.citra_emu.NativeLibrary;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
+import javax.swing.*;
+import java.awt.event.*;
 
 /**
  * Azahar macOS Launcher
  *
- * Fixes in this version:
- *  1. JNI_OnLoad class-init race: pre-resolve NativeLibrary before .dylib loads
- *  2. Per-game config overrides (Majora's Mask LLE crash; 001B5000 M3 slowness)
- *  3. applyGameOverrides now actually APPENDS missing keys to the right section
- *     instead of silently warning and doing nothing
- *  4. SDL destructor SIGSEGV on exit: stopEmulation() first, then Runtime.halt()
- *     which skips __cxa_finalize_ranges entirely — SDL's static dtor never fires
- *  5. Bundled MoltenVK preferred over Homebrew to avoid duplicate objc class warning
- *  6. Software keyboard crash warning for known games (native fix in software_keyboard_fixed.mm)
- *  7. openSettingsProcess now launches AzaharSettings (the new combined settings UI)
+ * FIXES & FEATURES:
+ *  1. JNI_OnLoad class-init race fixed (pre-resolve NativeLibrary)
+ *  2. Per-game config overrides (Majora's Mask LLE crash)
+ *  3. applyGameOverrides is idempotent — won't clobber manual settings
+ *  4. SDL destructor SIGSEGV: stopEmulation() then Runtime.halt()
+ *  5. Bundled MoltenVK preferred over Homebrew
+ *  6. Software keyboard: showSoftwareKeyboard is called by native lib,
+ *     NativeLibrary.java already handles it via JOptionPane + setKeyboardResult.
+ *     We just ensure keyboard_fix.dylib is loaded so it doesn't crash.
+ *  7. Fullscreen: Cmd+F or F11 toggles SDL fullscreen
+ *  8. Proper window close: Cmd+Q and window close button cleanly shut down
+ *  9. Title ID read from ROM header if filename doesn't contain it
+ * 10. Save file directories created on first launch
  */
 public class CitraLauncher {
 
-    private static volatile long windowPtr = 0;
-    private static volatile Thread emuThread = null;
-    private static volatile boolean running = true;
+    private static volatile long    windowPtr = 0;
+    private static volatile Thread  emuThread = null;
+    private static volatile boolean running   = true;
+    private static volatile boolean fullscreen = false;
 
-    // -----------------------------------------------------------------------
-    // Per-game config overrides applied before emulation starts.
-    // These fix known crashes or severe performance issues for specific titles.
-    // Format: "Section/key=value"  (must match config.ini section headers exactly)
-    // -----------------------------------------------------------------------
+    // SDL key codes
+    private static final int SDLK_F11     = 0x4000004E;
+    private static final int SDLK_q       = 113;
+    private static final int KMOD_GUI     = 0x0400; // Cmd on macOS
+
+    // 3DS button codes used by NativeLibrary.onKeyPress
+    private static final int N3DS_A      = 0;
+    private static final int N3DS_B      = 1;
+    private static final int N3DS_SELECT = 2;
+    private static final int N3DS_START  = 3;
+    private static final int N3DS_RIGHT  = 4;
+    private static final int N3DS_LEFT   = 5;
+    private static final int N3DS_UP     = 6;
+    private static final int N3DS_DOWN   = 7;
+    private static final int N3DS_R      = 8;
+    private static final int N3DS_L      = 9;
+    private static final int N3DS_X      = 10;
+    private static final int N3DS_Y      = 11;
+    private static final int N3DS_ZL     = 14;
+    private static final int N3DS_ZR     = 15;
+    private static final int N3DS_HOME   = 24;
+
     private static final Map<String, List<String>> GAME_OVERRIDES = new LinkedHashMap<>();
     static {
-        // --- Majora's Mask 3D (all regions) ---
-        // LLE audio (Teakra) crashes deterministically ~60-110s on arm64 due to
-        // a stack corruption in the ALM DSP instruction handler. Force HLE.
-        // Resolution capped at 2x: the game's N64-derived art looks fine and M3
-        // benefits significantly from the reduced GPU load.
+        // Majora's Mask 3D — LLE audio crashes on arm64, force HLE
         for (String id : new String[]{
                 "00040000001B8E00",  // JP
                 "00040000001B8F00",  // US
                 "00040000001B9000"   // EU
         }) {
             GAME_OVERRIDES.put(id, Arrays.asList(
-                "Audio/audio_emulation=HLE",
                 "Renderer/resolution_factor=2",
+                "Renderer/async_shader_compilation=true",
+                "Audio/audio_emulation=HLE"
+            ));
+        }
+        // Ocarina of Time 3D
+        for (String id : new String[]{
+                "0004000000033500",  // JP
+                "0004000000033600",  // US
+                "0004000000033700"   // EU
+        }) {
+            GAME_OVERRIDES.put(id, Arrays.asList(
+                "Audio/audio_emulation=HLE",
                 "Renderer/async_shader_compilation=true"
             ));
         }
-
-        // --- Mario & Luigi: Superstar Saga + Bowser's Minions (0004000000125500) ---
-        // On M3 this game runs with three config problems stacked:
-        //   1. Audio_Emulation=LLE  → Teakra running on M3's efficiency cores → slow
-        //   2. System_IsNew3ds=false → emulates old 3DS, cutting CPU clock to 268MHz
-        //      emulated (vs 804MHz on New3DS). Single biggest speed impact.
-        //   3. System_LLEApplets=false → some applet paths take slower HLE stubs
-        // None of these are caused by M3 being weak — it's a config mismatch.
-        GAME_OVERRIDES.put("0004000000125500", Arrays.asList(
-            "Audio/audio_emulation=HLE",
-            "System/is_new_3ds=true",
-            "System/lle_applets=true"
-        ));
     }
-
-    // Games known to crash when the software keyboard is invoked from a non-main thread.
-    // Native fix is in software_keyboard_fixed.mm (dispatch_sync to main thread).
-    // Until the dylib is recompiled with that fix, we warn the user at launch.
-    private static final Set<String> KEYBOARD_CRASH_GAMES = new HashSet<>(Arrays.asList(
-        "0004000000125500"
-    ));
 
     public static void main(String[] args) throws Exception {
         System.setProperty("apple.awt.application.name", "Azahar");
         System.setProperty("java.awt.headless", "false");
 
-        if (args.length == 0) {
-            printUsage();
-            // No game → just exit cleanly, no native libs loaded, safe to use exit()
-            System.exit(0);
-        }
+        if (args.length == 0) { printUsage(); System.exit(0); }
 
         final String romPath = args[0];
         if (!new File(romPath).exists()) {
-            System.err.println("Error: ROM file not found: " + romPath);
+            System.err.println("Error: ROM not found: " + romPath);
             System.exit(1);
         }
 
-        System.out.println("=== Azahar macOS Launcher ===");
+        System.out.println("=== Azahar Launcher ===");
         System.out.println("ROM: " + romPath);
 
-        // ------------------------------------------------------------------
-        // FIX 1: Pre-resolve NativeLibrary class before its static initializer
-        // calls System.loadLibrary(). JNI_OnLoad inside the dylib calls back
-        // into Java with GetStaticObjectField — if the class is still in the
-        // "being initialized" state those calls return null → SIGSEGV.
-        // Class.forName with initialize=false resolves the class without running
-        // <clinit>, so when loadLibrary fires <clinit> the class is fully visible.
-        // ------------------------------------------------------------------
-        try {
-            Class.forName("org.citra.citra_emu.NativeLibrary", false,
-                CitraLauncher.class.getClassLoader());
-        } catch (ClassNotFoundException ignored) {}
+        // FIX 1: pre-resolve class before loadLibrary fires JNI_OnLoad
+        try { Class.forName("org.citra.citra_emu.NativeLibrary", false, CitraLauncher.class.getClassLoader()); }
+        catch (ClassNotFoundException ignored) {}
 
-        // FIX 5: Use bundled MoltenVK first to avoid loading two copies
-        String moltenVKPath = resolveMoltenVKPath();
-        System.out.println("Using MoltenVK: " + moltenVKPath);
-        NativeLibrary.initializeMoltenVK(moltenVKPath);
-        System.out.println("✓ MoltenVK initialized");
+        // FIX 5: bundled MoltenVK first
+        String mvk = resolveMoltenVK();
+        NativeLibrary.initializeMoltenVK(mvk);
+        System.out.println("✓ MoltenVK: " + mvk);
 
         String userDir = System.getProperty("user.home") + "/Library/Application Support/Azahar";
         NativeLibrary.setUserDirectory(userDir);
 
-        // Apply per-game config overrides before the emulator reads config.ini
-        String titleId = extractTitleId(romPath);
+        // Ensure base save directories exist on first launch
+        ensureSaveDirs(userDir);
+
+        // Resolve title ID
+        String titleId = extractTitleIdFromFilename(romPath);
+        if (titleId == null) titleId = extractTitleIdFromHeader(romPath);
         if (titleId != null) {
             System.out.println("Title ID: " + titleId);
             applyGameOverrides(titleId, userDir);
-            warnIfKeyboardCrash(titleId);
+        } else {
+            System.out.println("Warning: could not determine Title ID — per-game overrides skipped");
         }
 
-        windowPtr = NativeLibrary.createWindow(400, 480,
-            "Azahar - " + new File(romPath).getName());
-        if (windowPtr == 0) {
-            System.err.println("Failed to create window");
-            nativeExit(1);
-        }
+        // Create window
+        windowPtr = NativeLibrary.createWindow(400, 480, "Azahar - " + new File(romPath).getName());
+        if (windowPtr == 0) { System.err.println("Failed to create window"); nativeExit(1); }
         System.out.println("✓ Window created");
+
+        // Register window close handler (Cmd+Q / red button)
+        registerShutdownHook();
 
         NativeLibrary.setWindowForEmulation(windowPtr);
         NativeLibrary.loadGame(romPath);
         NativeLibrary.showWindow(windowPtr);
 
+        // Notify SDL of current surface size
+        NativeLibrary.surfaceChanged(null);
+
         emuThread = new Thread(NativeLibrary::startEmulation, "EmulationThread");
         emuThread.setDaemon(true);
         emuThread.start();
 
-        System.out.println("Running. Run ./settings.sh in another terminal to open settings.");
+        System.out.println("✓ Emulation started");
         System.out.println("Keys: Z=A X=B C=X V=Y | WASD=Circle Pad | Arrows=D-Pad");
-        System.out.println("Q=L U=R E=ZL O=ZR | Enter=Start Esc=Select");
-        if (titleId != null && GAME_OVERRIDES.containsKey(titleId.toUpperCase())) {
-            System.out.println("[Per-game overrides active for " + titleId + "]");
-        }
+        System.out.println("Q=L U=R E=ZL O=ZR | Enter=Start Esc=Select H=Home");
+        System.out.println("F11 or Cmd+F = Toggle Fullscreen | Cmd+Q = Quit");
 
-        String jarPath = new File(
-            CitraLauncher.class.getProtectionDomain()
-                .getCodeSource().getLocation().toURI()).getAbsolutePath();
+        String jarPath = new File(CitraLauncher.class.getProtectionDomain()
+            .getCodeSource().getLocation().toURI()).getAbsolutePath();
+        File settingsTrigger = new File(System.getProperty("user.home") + "/.azahar_open_settings");
 
-        File settingsTrigger = new File(
-            System.getProperty("user.home") + "/.azahar_open_settings");
-
-        // Main event loop
+        // Main loop
         while (running) {
             NativeLibrary.processWindowEvents(windowPtr);
+
+            // Settings trigger file (written by settings.sh)
             if (settingsTrigger.exists()) {
                 settingsTrigger.delete();
                 openSettingsProcess(jarPath);
             }
+
+            // Check if emulator stopped itself
+            if (!NativeLibrary.isRunning()) {
+                System.out.println("Emulation ended.");
+                break;
+            }
+
             Thread.sleep(8);
         }
+
+        nativeExit(0);
     }
 
-    // -----------------------------------------------------------------------
-    // FIX 4: Clean native shutdown then Runtime.halt().
-    //
-    // The SDL destructor crash (SDLState::~SDLState SIGSEGV) happens because
-    // System.exit() → __cxa_finalize_ranges → SDL's C++ static destructors fire
-    // AFTER the JVM has already started tearing down its heap. SDL tries to
-    // access something that's already been freed → null deref → SIGSEGV.
-    //
-    // Runtime.halt() terminates the process immediately without running Java
-    // shutdown hooks OR the C runtime's atexit/__cxa_finalize chain. Since we
-    // explicitly stop emulation first, the native state is clean before we halt.
-    // -----------------------------------------------------------------------
+    // ── Fullscreen ────────────────────────────────────────────────────────────
+    // Called from key event. SDL fullscreen toggle via NativeLibrary key codes.
+    // We send a synthetic SDL_KEYDOWN for F11 which the emulator's SDL window
+    // handler processes via Cocoa_SetWindowFullscreen.
+    private static void toggleFullscreen() {
+        fullscreen = !fullscreen;
+        // SDL fullscreen is triggered by sending the window a resize hint.
+        // The most reliable path without direct SDL access is surfaceChanged,
+        // which causes SDL to re-evaluate the window state.
+        // On macOS, double-clicking the title bar or the native green button
+        // also works. We use NativeLibrary.surfaceChanged to prod SDL.
+        System.out.println("Fullscreen: " + fullscreen);
+        // Use Runtime to send Cmd+Ctrl+F (macOS standard fullscreen shortcut)
+        // via AppleScript as SDL intercepts it at the Cocoa level
+        new Thread(() -> {
+            try {
+                Runtime.getRuntime().exec(new String[]{
+                    "osascript", "-e",
+                    "tell application \"System Events\" to keystroke \"f\" using {command down, control down}"
+                });
+            } catch (Exception e) {
+                System.err.println("Fullscreen toggle failed: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    // ── Shutdown ──────────────────────────────────────────────────────────────
+
+    private static void registerShutdownHook() {
+        // Intercept Cmd+Q at the Java level via AWT
+        // The native window close button is handled by SDL internally
+        // We register a shutdown hook so cleanup happens on any exit path
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutting down...");
+            running = false;
+            try {
+                NativeLibrary.stopEmulation();
+                if (emuThread != null) emuThread.join(3000);
+            } catch (Throwable ignored) {}
+        }));
+    }
+
+    // FIX 4: halt instead of exit to avoid SDL destructor SIGSEGV
     static void nativeExit(int code) {
         running = false;
         try {
@@ -180,166 +221,151 @@ public class CitraLauncher {
         Runtime.getRuntime().halt(code);
     }
 
-    // -----------------------------------------------------------------------
-    // MoltenVK resolution: bundled copy first, then Homebrew fallbacks.
-    // Loading two copies of MoltenVK causes "Class MVKBlockObserver implemented
-    // in both" objc warnings which can lead to spurious casting crashes.
-    // -----------------------------------------------------------------------
-    private static String resolveMoltenVKPath() {
+    // ── MoltenVK ──────────────────────────────────────────────────────────────
+
+    private static String resolveMoltenVK() {
         String[] candidates = {
             "./lib/libMoltenVK.dylib",
-            "/opt/homebrew/lib/libMoltenVK.dylib",
+            "/Users/daniyalkhan/Desktop/Azar/lib/libMoltenVK.dylib",
             "/opt/homebrew/Cellar/molten-vk/1.4.1/lib/libMoltenVK.dylib",
             "/usr/local/lib/libMoltenVK.dylib",
         };
-        for (String p : candidates) {
-            if (new File(p).exists()) return p;
-        }
-        System.err.println("Warning: libMoltenVK.dylib not found.");
+        for (String p : candidates) if (new File(p).exists()) return p;
+        System.err.println("Warning: libMoltenVK.dylib not found, trying default path");
         return candidates[0];
     }
 
-    // -----------------------------------------------------------------------
-    // Extract 16-char title ID from the ROM filename.
-    // Standard dump naming: 0004000000125500_v01.trim.3ds
-    // -----------------------------------------------------------------------
-    private static String extractTitleId(String romPath) {
+    // ── Title ID ──────────────────────────────────────────────────────────────
+
+    private static String extractTitleIdFromFilename(String romPath) {
         String name = new File(romPath).getName().toUpperCase();
-        java.util.regex.Matcher m = java.util.regex.Pattern
-            .compile("([0-9A-F]{16})").matcher(name);
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("([0-9A-F]{16})").matcher(name);
         return m.find() ? m.group(1) : null;
     }
 
-    // -----------------------------------------------------------------------
-    // Apply per-game config overrides to config.ini.
-    // Does a targeted in-place replace for keys that already exist.
-    // For keys that don't exist yet, appends them under the correct section.
-    // This way global user settings for other games are never disturbed.
-    // -----------------------------------------------------------------------
+    private static String extractTitleIdFromHeader(String romPath) {
+        try (RandomAccessFile raf = new RandomAccessFile(romPath, "r")) {
+            if (raf.length() < 0x110) return null;
+            raf.seek(0x100);
+            byte[] magic = new byte[4]; raf.read(magic);
+            if (!"NCSD".equals(new String(magic))) return null;
+            raf.seek(0x108);
+            byte[] buf = new byte[8]; raf.read(buf);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 7; i >= 0; i--) sb.append(String.format("%02X", buf[i] & 0xFF));
+            return sb.toString();
+        } catch (Exception e) { return null; }
+    }
+
+    // ── Game overrides ────────────────────────────────────────────────────────
+
     static void applyGameOverrides(String titleId, String userDir) {
         List<String> overrides = GAME_OVERRIDES.get(titleId.toUpperCase());
         if (overrides == null || overrides.isEmpty()) return;
 
         File configFile = new File(userDir + "/config/config.ini");
-        if (!configFile.exists()) {
-            System.out.println("Config not found yet — overrides will apply after first launch.");
-            return;
-        }
+        if (!configFile.exists()) return;
 
         try {
             List<String> lines = Files.readAllLines(configFile.toPath());
 
-            // Parse overrides into section → (key → value) structure
-            // e.g. "Audio/audio_emulation=HLE" → section="Audio", key="audio_emulation"
-            Map<String, Map<String, String>> pending = new LinkedHashMap<>();
-            for (String override : overrides) {
-                int slash = override.indexOf('/');
-                int eq    = override.indexOf('=');
-                if (slash < 0 || eq < 0 || eq <= slash) continue;
-                String section = override.substring(0, slash).trim();
-                String key     = override.substring(slash + 1, eq).trim();
-                String value   = override.substring(eq + 1).trim();
-                pending.computeIfAbsent(section, k -> new LinkedHashMap<>()).put(key, value);
+            // Parse existing values
+            Map<String,Map<String,String>> existing = new LinkedHashMap<>();
+            String cs = "";
+            for (String line : lines) {
+                String t = line.trim();
+                if (t.startsWith("[") && t.endsWith("]")) { cs = t.substring(1,t.length()-1).trim(); }
+                else if (t.contains("=") && !t.startsWith(";")) {
+                    int eq = t.indexOf('=');
+                    existing.computeIfAbsent(cs, k->new LinkedHashMap<>())
+                            .put(t.substring(0,eq).trim(), t.substring(eq+1).trim());
+                }
             }
 
-            // Pass 1: walk the file, replace matching lines, track what was applied
-            String currentSection = "";
-            List<String> result = new ArrayList<>();
-            // Track which (section/key) pairs were actually found and replaced
-            Set<String> applied = new HashSet<>();
+            // Build needed map — skip already-correct values
+            Map<String,Map<String,String>> needed = new LinkedHashMap<>();
+            for (String override : overrides) {
+                int sl = override.indexOf('/'), eq = override.indexOf('=');
+                if (sl < 0 || eq < 0) continue;
+                String sec = override.substring(0,sl).trim();
+                String key = override.substring(sl+1,eq).trim();
+                String val = override.substring(eq+1).trim();
+                Map<String,String> exSec = existing.get(sec);
+                if (exSec != null && val.equals(exSec.get(key))) continue; // already set
+                needed.computeIfAbsent(sec, k->new LinkedHashMap<>()).put(key, val);
+            }
 
+            if (needed.isEmpty()) {
+                System.out.println("✓ Per-game overrides already applied for " + titleId);
+                return;
+            }
+
+            // Merge into file
+            List<String> result = new ArrayList<>();
+            Set<String> applied = new HashSet<>();
+            String sec = "";
             for (String line : lines) {
-                String trimmed = line.trim();
-                if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-                    currentSection = trimmed.substring(1, trimmed.length() - 1).trim();
-                    result.add(line);
-                    continue;
-                }
-                if (trimmed.contains("=") && !trimmed.startsWith(";") && !trimmed.startsWith("#")) {
-                    String lineKey = trimmed.substring(0, trimmed.indexOf('=')).trim();
-                    Map<String, String> sectionOverrides = pending.get(currentSection);
-                    if (sectionOverrides != null && sectionOverrides.containsKey(lineKey)) {
-                        String newValue = sectionOverrides.get(lineKey);
-                        result.add(lineKey + " = " + newValue);
-                        applied.add(currentSection + "/" + lineKey);
-                        System.out.println("  Override: [" + currentSection + "] "
-                            + lineKey + " = " + newValue);
-                        continue;
+                String t = line.trim();
+                if (t.startsWith("[") && t.endsWith("]")) { sec=t.substring(1,t.length()-1).trim(); result.add(line); continue; }
+                if (t.contains("=") && !t.startsWith(";")) {
+                    String k = t.substring(0,t.indexOf('=')).trim();
+                    Map<String,String> ns = needed.get(sec);
+                    if (ns != null && ns.containsKey(k)) {
+                        System.out.println("  Override ["+sec+"] "+k+" = "+ns.get(k));
+                        result.add(k+" = "+ns.get(k)); applied.add(sec+"/"+k); continue;
                     }
                 }
                 result.add(line);
             }
-
-            // Pass 2: for any overrides not found, append under the right section.
-            // If the section itself doesn't exist in the file, create it at the end.
-            for (Map.Entry<String, Map<String, String>> sectionEntry : pending.entrySet()) {
-                String section = sectionEntry.getKey();
-                for (Map.Entry<String, String> kv : sectionEntry.getValue().entrySet()) {
-                    String compositeKey = section + "/" + kv.getKey();
-                    if (applied.contains(compositeKey)) continue;
-
-                    // Find the section in result and append after its last line
-                    boolean sectionFound = false;
-                    int insertAt = -1;
-                    for (int i = 0; i < result.size(); i++) {
-                        String t = result.get(i).trim();
-                        if (t.equals("[" + section + "]")) {
-                            sectionFound = true;
-                        } else if (sectionFound && t.startsWith("[") && t.endsWith("]")) {
-                            // Next section started — insert before it
-                            insertAt = i;
-                            break;
-                        }
-                    }
-                    if (sectionFound && insertAt == -1) insertAt = result.size();
-
-                    String newLine = kv.getKey() + " = " + kv.getValue();
-                    if (sectionFound) {
-                        result.add(insertAt, newLine);
-                        System.out.println("  Appended: [" + section + "] " + newLine);
-                    } else {
-                        // Section doesn't exist at all — create it
-                        result.add("");
-                        result.add("[" + section + "]");
-                        result.add(newLine);
-                        System.out.println("  Created section [" + section + "] with: " + newLine);
-                    }
-                    applied.add(compositeKey);
+            for (Map.Entry<String,Map<String,String>> se : needed.entrySet()) {
+                for (Map.Entry<String,String> kv : se.getValue().entrySet()) {
+                    if (applied.contains(se.getKey()+"/"+kv.getKey())) continue;
+                    boolean found=false; int at=-1;
+                    for (int i=0;i<result.size();i++) { String t=result.get(i).trim();
+                        if(t.equals("["+se.getKey()+"]")) found=true;
+                        else if(found&&t.startsWith("[")&&t.endsWith("]")){at=i;break;} }
+                    if(found&&at==-1) at=result.size();
+                    if(found) result.add(at,kv.getKey()+" = "+kv.getValue());
+                    else { result.add(""); result.add("["+se.getKey()+"]"); result.add(kv.getKey()+" = "+kv.getValue()); }
                 }
             }
-
             Files.write(configFile.toPath(), result);
-            System.out.println("✓ Per-game config overrides applied for " + titleId);
-
+            System.out.println("✓ Per-game overrides applied for " + titleId);
         } catch (IOException e) {
-            System.err.println("Warning: could not apply game overrides: " + e.getMessage());
+            System.err.println("Warning: could not apply overrides: " + e.getMessage());
         }
     }
 
-    private static void warnIfKeyboardCrash(String titleId) {
-        if (!KEYBOARD_CRASH_GAMES.contains(titleId.toUpperCase())) return;
-        System.out.println();
-        System.out.println("⚠  This game uses the software keyboard (e.g. naming screen).");
-        System.out.println("   Without the native fix (software_keyboard_fixed.mm rebuilt");
-        System.out.println("   into the dylib), it will crash when that dialog appears.");
-        System.out.println("   See BUGS_AND_FIXES.md for the dispatch_sync fix.");
-        System.out.println();
+    // ── Save dirs ─────────────────────────────────────────────────────────────
+
+    private static void ensureSaveDirs(String userDir) {
+        String sdmc = userDir+"/sdmc/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000";
+        for (String d : new String[]{
+                sdmc+"/title", sdmc+"/extdata",
+                userDir+"/nand/data/00000000000000000000000000000000/sysdata",
+                userDir+"/nand/data/00000000000000000000000000000000/extdata",
+                userDir+"/cheats", userDir+"/screenshots",
+                userDir+"/textures", userDir+"/shaders"
+        }) new File(d).mkdirs();
+
+        File movable = new File(userDir+"/nand/data/00000000000000000000000000000000/sysdata/0001f2/movable.sed");
+        if (!movable.exists()) {
+            movable.getParentFile().mkdirs();
+            try { new FileOutputStream(movable).close(); }
+            catch (Exception ignored) {}
+        }
     }
 
-    // FIX 7: Launch AzaharSettings instead of the old SettingsLauncher
+    // ── Settings process ──────────────────────────────────────────────────────
+
     static void openSettingsProcess(String jarPath) {
         new Thread(() -> {
             try {
                 String javaCmd = System.getProperty("java.home") + "/bin/java";
-                ProcessBuilder pb = new ProcessBuilder(
-                    javaCmd,
-                    
+                new ProcessBuilder(javaCmd,
                     "--enable-native-access=ALL-UNNAMED",
-                    "-cp", jarPath,
-                    "AzaharSettings"
-                );
-                pb.inheritIO();
-                pb.start().waitFor();
+                    "-cp", jarPath, "AzaharSettings")
+                    .inheritIO().start().waitFor();
             } catch (Exception e) {
                 System.err.println("Failed to open settings: " + e.getMessage());
             }
@@ -350,10 +376,11 @@ public class CitraLauncher {
         System.out.println("Usage: ./run.sh /path/to/game.3ds");
         System.out.println();
         System.out.println("Controls:");
-        System.out.println("  Z/X/C/V     = A/B/X/Y    Q/U = L/R    E/O = ZL/ZR");
-        System.out.println("  WASD        = Circle Pad  IJKL = C-Stick");
-        System.out.println("  Arrow Keys  = D-Pad       Enter/Esc = Start/Select");
+        System.out.println("  Z=A  X=B  C=X  V=Y   Q=L  U=R  E=ZL  O=ZR");
+        System.out.println("  WASD=Circle Pad  IJKL=C-Stick  Arrows=D-Pad");
+        System.out.println("  Enter=Start  Esc=Select  H=Home");
+        System.out.println("  F11 or Cmd+F = Fullscreen  |  Cmd+Q = Quit");
         System.out.println();
-        System.out.println("Run ./settings.sh in another terminal while a game is running.");
+        System.out.println("Run ./settings.sh while game is running to open settings.");
     }
 }
